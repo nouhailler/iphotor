@@ -4,7 +4,7 @@
 iphotor — Explorateur en lecture seule d'une ancienne bibliothèque iPhoto ou Photos (1 à 4),
 et de n'importe quel dossier d'images (mode « Explorer un dossier »).
 
-Version 1.3
+Version 1.4
 
 Principe fondamental : la bibliothèque iPhoto et les dossiers consultés ne sont JAMAIS modifiés.
   * Tous les fichiers de la bibliothèque sont ouverts en lecture seule ("rb").
@@ -12,6 +12,9 @@ Principe fondamental : la bibliothèque iPhoto et les dossiers consultés ne son
   * L'index et le cache des miniatures sont stockés dans
     ~/.cache/photoexplorer_iphoto/ (ou $XDG_CACHE_HOME/photoexplorer_iphoto/).
   * Les miniatures des dossiers explorés vont dans ~/.cache/photoexplorer_iphoto/dossiers/.
+  * Les favoris et les tags sont enregistrés dans ~/.local/share/iphotor/annotations.sqlite3.
+  * Les copies (« Copier vers un dossier… ») ne lisent que les fichiers sources ; elles sont
+    refusées vers une bibliothèque ou un dossier consulté et ne remplacent jamais un fichier.
 
 Utilisation :
     ./iphotor.py                       interface graphique
@@ -70,7 +73,7 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 APP_NAME = "iphotor"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # Emplacement par défaut (nom standard sous macOS) ; sinon, choisir via « Ouvrir une bibliothèque ».
 DEFAULT_LIBRARY = os.path.expanduser("~/Pictures/iPhoto Library")
@@ -1130,6 +1133,9 @@ class Settings:
         self.last_folder: str = ""
         self.folder_recursive: bool = False
         self.folder_sort: str = ""
+        self.copy_dest: str = ""
+        self.copy_original: bool = False
+        self.copy_open: bool = False
         self.load()
 
     def load(self) -> None:
@@ -1144,6 +1150,9 @@ class Settings:
             self.last_folder = _as_str(data.get("last_folder"))
             self.folder_recursive = bool(data.get("folder_recursive", False))
             self.folder_sort = _as_str(data.get("folder_sort"))
+            self.copy_dest = _as_str(data.get("copy_dest"))
+            self.copy_original = bool(data.get("copy_original", False))
+            self.copy_open = bool(data.get("copy_open", False))
 
     def save(self) -> None:
         try:
@@ -1152,7 +1161,8 @@ class Settings:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({"last_library": self.last_library, "recent": self.recent,
                            "last_folder": self.last_folder, "folder_recursive": self.folder_recursive,
-                           "folder_sort": self.folder_sort},
+                           "folder_sort": self.folder_sort, "copy_dest": self.copy_dest,
+                           "copy_original": self.copy_original, "copy_open": self.copy_open},
                           fh, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
         except OSError as exc:
@@ -1366,11 +1376,12 @@ def _like_escape(s: str) -> str:
 @dataclass(frozen=True)
 class View:
     """Ce qui est affiché dans la grille."""
-    kind: str                     # "all" | "album" | "year" | "search" | "empty"
+    kind: str                     # "all" | "album" | "year" | "search" | "keys" | "folder" | "empty"
     album_id: Optional[int] = None
     year: Optional[int] = None
     query: str = ""
     title: str = ""
+    keys: tuple = ()              # "keys" : favoris ou tag (GUID, ou « id:N »)
 
 
 class PhotoManager:
@@ -1414,6 +1425,12 @@ class PhotoManager:
                         "ORDER BY ap.position", [view.album_id, q])
             return (f"SELECT {select} FROM photos p "
                     "WHERE p.search LIKE ? ESCAPE '\\' ORDER BY p.date, p.id", [q])
+        if view.kind == "keys":
+            keys = json.dumps(list(view.keys))
+            return (f"SELECT {select} FROM photos p "
+                    "WHERE p.guid IN (SELECT value FROM json_each(?)) "
+                    "OR ('id:' || p.id) IN (SELECT value FROM json_each(?)) ORDER BY p.date, p.id",
+                    [keys, keys])
         return ("SELECT " + select + " FROM photos p WHERE 0", [])
 
     def count(self, view: View) -> int:
@@ -1845,6 +1862,8 @@ class FolderBrowser:
         self.sort_desc = False
         self.query = ""
         self.subdir: Optional[str] = None
+        self.only: Optional[set[str]] = None     # favoris / tag : clés des images à garder
+        self.only_title = ""
         self.order: list[int] = []
 
     def load(self, scanner: FolderScanner) -> None:
@@ -1864,6 +1883,7 @@ class FolderBrowser:
             self.dir_counts[key] = self.dir_counts.get(key, 0) + 1
         self.query = ""
         self.subdir = None
+        self.only = None
         self.refresh()
 
     def set_sort(self, key: str, desc: bool) -> None:
@@ -1877,6 +1897,9 @@ class FolderBrowser:
         if sub:
             prefix = sub + "/"
             idx = [i for i in idx if self.photos[i].folder == sub or self.photos[i].folder.startswith(prefix)]
+        if self.only is not None:
+            only = self.only
+            idx = [i for i in idx if path_key(self.photos[i].image_path) in only]
         q = normalize_text(self.query.strip())
         if q:
             idx = [i for i in idx if q in normalize_text(self.photos[i].filename)]
@@ -1962,10 +1985,608 @@ class FolderThumbCache:
 
 
 # ---------------------------------------------------------------------------
+# Favoris et tags (stockés hors des bibliothèques et des dossiers consultés)
+# ---------------------------------------------------------------------------
+
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "iphotor")
+ANNOTATIONS_PATH = os.path.join(DATA_DIR, "annotations.sqlite3")
+FILES_SCOPE = "fichiers"   # images des dossiers indépendants (clé = chemin absolu)
+
+
+def library_scope(root: str) -> str:
+    return "bib:" + os.path.abspath(root.rstrip("/"))
+
+
+def path_key(path: str) -> str:
+    """Clé texte d'un chemin, même si le nom n'est pas de l'UTF-8 valide."""
+    path = os.path.abspath(path)
+    try:
+        path.encode("utf-8")
+        return path
+    except UnicodeEncodeError:
+        return "hex:" + os.fsencode(path).hex()
+
+
+def photo_scope_key(photo: Photo, library_root: str) -> tuple[str, str]:
+    """(portée, clé) qui identifie durablement une photo pour les favoris et les tags."""
+    if photo.source == "folder":
+        return FILES_SCOPE, path_key(photo.image_path)
+    return library_scope(library_root), (photo.guid or f"id:{photo.id}")
+
+
+def clean_tag(tag: str) -> str:
+    return " ".join(tag.replace(",", " ").split())[:60]
+
+
+class Annotations:
+    """Favoris et tags de l'utilisateur (~/.local/share/iphotor/annotations.sqlite3).
+
+    Ces informations appartiennent à iphotor : elles ne sont jamais écrites dans la
+    bibliothèque ni dans les dossiers consultés, et survivent à un vidage du cache.
+    """
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS favorites (scope TEXT, key TEXT, added REAL, PRIMARY KEY (scope, key));
+    CREATE TABLE IF NOT EXISTS tags (scope TEXT, key TEXT, tag TEXT, PRIMARY KEY (scope, key, tag));
+    CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(scope, tag);
+    """
+
+    def __init__(self, path: str = ANNOTATIONS_PATH):
+        self.path = path
+        self.con: Optional[sqlite3.Connection] = None
+        self.error = ""
+        self._fav: dict[str, set[str]] = {}
+        self._tags: dict[str, dict[str, list[str]]] = {}
+
+    def _db(self) -> sqlite3.Connection:
+        if self.con is None:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.con = sqlite3.connect(self.path)
+            self.con.executescript(self.SCHEMA)
+        return self.con
+
+    def close(self) -> None:
+        if self.con is not None:
+            self.con.close()
+            self.con = None
+
+    def _load(self, scope: str) -> None:
+        if scope in self._fav:
+            return
+        con = self._db()
+        self._fav[scope] = {r[0] for r in con.execute("SELECT key FROM favorites WHERE scope=?", (scope,))}
+        tags: dict[str, list[str]] = {}
+        for key, tag in con.execute("SELECT key, tag FROM tags WHERE scope=?", (scope,)):
+            tags.setdefault(key, []).append(tag)
+        for lst in tags.values():
+            lst.sort(key=normalize_text)
+        self._tags[scope] = tags
+
+    # -- favoris -------------------------------------------------------------
+    def is_favorite(self, scope: str, key: str) -> bool:
+        self._load(scope)
+        return key in self._fav[scope]
+
+    def set_favorite(self, scope: str, key: str, on: bool) -> None:
+        self._load(scope)
+        con = self._db()
+        with con:
+            if on:
+                con.execute("INSERT OR REPLACE INTO favorites VALUES (?, ?, ?)", (scope, key, time.time()))
+                self._fav[scope].add(key)
+            else:
+                con.execute("DELETE FROM favorites WHERE scope=? AND key=?", (scope, key))
+                self._fav[scope].discard(key)
+
+    def favorites(self, scope: str) -> set[str]:
+        self._load(scope)
+        return set(self._fav[scope])
+
+    # -- tags ----------------------------------------------------------------
+    def tags_of(self, scope: str, key: str) -> list[str]:
+        self._load(scope)
+        return list(self._tags[scope].get(key, []))
+
+    def set_tags(self, scope: str, key: str, tags: Iterable[str]) -> None:
+        self._load(scope)
+        clean = sorted({t for t in (clean_tag(x) for x in tags) if t}, key=normalize_text)
+        con = self._db()
+        with con:
+            con.execute("DELETE FROM tags WHERE scope=? AND key=?", (scope, key))
+            con.executemany("INSERT INTO tags VALUES (?, ?, ?)", [(scope, key, t) for t in clean])
+        if clean:
+            self._tags[scope][key] = clean
+        else:
+            self._tags[scope].pop(key, None)
+
+    def all_tags(self, scope: str) -> list[str]:
+        self._load(scope)
+        names = {t for lst in self._tags[scope].values() for t in lst}
+        return sorted(names, key=normalize_text)
+
+    def keys_with_tag(self, scope: str, tag: str) -> set[str]:
+        self._load(scope)
+        return {k for k, lst in self._tags[scope].items() if tag in lst}
+
+
+# ---------------------------------------------------------------------------
+# Informations EXIF
+# ---------------------------------------------------------------------------
+
+_EXIF_ORIENT = {1: "Normale", 2: "Miroir horizontal", 3: "Retournée (180°)", 4: "Miroir vertical",
+                5: "Miroir + rotation 90° antihoraire", 6: "Rotation 90° horaire",
+                7: "Miroir + rotation 90° horaire", 8: "Rotation 90° antihoraire"}
+_EXIF_PROGRAM = {0: "Non défini", 1: "Manuel", 2: "Programme normal", 3: "Priorité ouverture",
+                 4: "Priorité vitesse", 5: "Créatif", 6: "Action", 7: "Portrait", 8: "Paysage"}
+_EXIF_METERING = {0: "Inconnue", 1: "Moyenne", 2: "Pondérée centrale", 3: "Spot", 4: "Multi-spot",
+                  5: "Matricielle", 6: "Partielle", 255: "Autre"}
+_EXIF_WB = {0: "Automatique", 1: "Manuelle"}
+_EXIF_SKIP_BINARY = {0x927C, 0x9286, 0x02BC, 0x8773, 0x83BB}  # MakerNote, UserComment, XMP, ICC, IPTC
+
+
+def _rational(value) -> Optional[float]:
+    try:
+        if isinstance(value, tuple) and len(value) == 2:
+            return value[0] / value[1] if value[1] else None
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _exif_text(value) -> str:
+    """Valeur EXIF brute -> texte lisible."""
+    if isinstance(value, bytes):
+        raw = value.rstrip(b"\x00")
+        if raw and len(raw) <= 200 and all(32 <= b < 127 for b in raw):
+            return raw.decode("ascii")
+        return f"(données binaires, {len(value)} octets)"
+    if isinstance(value, str):
+        return value.replace("\x00", "").strip()
+    if isinstance(value, tuple):
+        return ", ".join(_exif_text(v) for v in value[:16]) + (" …" if len(value) > 16 else "")
+    f = _rational(value) if not isinstance(value, int) else None
+    if f is not None and not isinstance(value, (int, float)):
+        return f"{f:.6g}"
+    return str(value)
+
+
+def _gps_degrees(dms, ref) -> Optional[float]:
+    try:
+        d, m, s = (_rational(x) for x in dms)
+        val = d + m / 60 + s / 3600
+    except (TypeError, ValueError):
+        return None
+    ref = ref.decode() if isinstance(ref, bytes) else str(ref or "")
+    return -val if ref.strip().upper() in ("S", "W") else val
+
+
+def _user_comment(value) -> str:
+    if isinstance(value, bytes) and len(value) > 8:
+        head, body = value[:8], value[8:]
+        try:
+            text = body.decode("utf-16" if head.startswith(b"UNICODE") else "latin-1")
+        except UnicodeDecodeError:
+            return ""
+        return text.replace("\x00", "").strip()
+    return _exif_text(value) if isinstance(value, str) else ""
+
+
+def read_exif(path: str) -> dict:
+    """Lit les métadonnées EXIF d'un fichier (lecture seule, en-tête uniquement).
+
+    Renvoie {"summary": [(libellé, valeur)], "groups": [(groupe, [(balise, valeur)])],
+             "gps": (lat, lon) | None, "error": str}.
+    """
+    result: dict = {"summary": [], "groups": [], "gps": None, "error": ""}
+    try:
+        import warnings
+        from PIL import ExifTags
+        with warnings.catch_warnings(), Image.open(path) as im:
+            warnings.simplefilter("ignore")
+            fmt, dims, mode = im.format or "", im.size, im.mode
+            exif = im.getexif()
+            ifd0 = dict(exif)
+            try:
+                sub = dict(exif.get_ifd(0x8769))
+            except Exception:
+                sub = {}
+            try:
+                gps = dict(exif.get_ifd(0x8825))
+            except Exception:
+                gps = {}
+            info = {k: v for k, v in im.info.items() if isinstance(v, str) and len(v) < 300}
+    except Exception as exc:
+        tool = shutil.which("exiftool")
+        if tool:
+            return _read_exif_tool(tool, path)
+        if file_ext(path) in HEIF_EXTS:
+            result["error"] = ("Les informations EXIF des fichiers HEIC ne peuvent être lues qu'avec "
+                               "l'outil exiftool (paquet libimage-exiftool-perl).")
+        else:
+            detail = "format non reconnu" if "cannot identify image file" in str(exc) else str(exc)
+            result["error"] = f"Lecture des informations impossible : {detail}"
+        return result
+
+    tags = dict(ifd0)
+    tags.update(sub)
+    s: list[tuple[str, str]] = []
+    s.append(("Format", f"{fmt} — {mode}" if fmt else mode))
+    w, h = dims
+    if file_ext(path) in RAW_EXTS and tags.get(0xA002) and tags.get(0xA003):
+        w, h = int(tags[0xA002]), int(tags[0xA003])    # le RAW lui-même, pas son aperçu
+    if tags.get(0x0112) in (5, 6, 7, 8):
+        w, h = h, w
+    s.append(("Dimensions", f"{w} × {h} px ({w * h / 1e6:.1f} Mpx)".replace(".", ",")))
+    make, model = _exif_text(tags.get(0x010F, "")).strip(), _exif_text(tags.get(0x0110, "")).strip()
+    if model or make:
+        s.append(("Appareil", model if make and model.lower().startswith(make.split()[0].lower())
+                  else " ".join(x for x in (make, model) if x)))
+    if 0xA434 in tags:
+        s.append(("Objectif", _exif_text(tags[0xA434])))
+    for tag, label in ((0x9003, "Date de prise de vue"), (0x0132, "Date de modification")):
+        if tag in tags:
+            s.append((label, _exif_text(tags[tag]).replace(":", "-", 2).replace(" ", " à ", 1)))
+            break
+    t = _rational(tags.get(0x829A))
+    if t:
+        s.append(("Temps de pose", f"1/{round(1 / t)} s" if t < 1 else f"{t:g} s"))
+    f = _rational(tags.get(0x829D))
+    if f:
+        s.append(("Ouverture", f"f/{f:.1f}".replace(".", ",")))
+    iso = tags.get(0x8827)
+    if iso:
+        s.append(("Sensibilité", f"ISO {iso[0] if isinstance(iso, tuple) else iso}"))
+    fl = _rational(tags.get(0x920A))
+    if fl:
+        eq = tags.get(0xA405)
+        s.append(("Focale", f"{fl:g} mm".replace(".", ",") + (f" (équiv. 24×36 : {eq} mm)" if eq else "")))
+    bias = _rational(tags.get(0x9204))
+    if bias is not None and 0x9204 in tags:
+        s.append(("Correction d'exposition", f"{bias:+.1f} EV".replace(".", ",")))
+    if 0x8822 in tags:
+        s.append(("Mode d'exposition", _EXIF_PROGRAM.get(tags[0x8822], str(tags[0x8822]))))
+    if 0x9207 in tags:
+        s.append(("Mesure", _EXIF_METERING.get(tags[0x9207], str(tags[0x9207]))))
+    if 0x9209 in tags:
+        try:
+            s.append(("Flash", "Déclenché" if int(tags[0x9209]) & 1 else "Non déclenché"))
+        except (TypeError, ValueError):
+            pass
+    if 0xA403 in tags:
+        s.append(("Balance des blancs", _EXIF_WB.get(tags[0xA403], str(tags[0xA403]))))
+    if 0x0112 in tags:
+        s.append(("Orientation", _EXIF_ORIENT.get(tags[0x0112], str(tags[0x0112]))))
+    for tag, label in ((0x0131, "Logiciel"), (0x013B, "Auteur"), (0x8298, "Copyright"),
+                       (0x010E, "Description")):
+        if tags.get(tag):
+            txt = _exif_text(tags[tag])
+            if txt and not txt.startswith("(données"):
+                s.append((label, txt))
+    uc = _user_comment(tags.get(0x9286))
+    if uc:
+        s.append(("Commentaire", uc))
+    if gps:
+        lat = _gps_degrees(gps.get(2), gps.get(1)) if 2 in gps else None
+        lon = _gps_degrees(gps.get(4), gps.get(3)) if 4 in gps else None
+        if lat is not None and lon is not None:
+            result["gps"] = (lat, lon)
+            s.append(("Coordonnées GPS", f"{lat:.6f}, {lon:.6f}"))
+        alt = _rational(gps.get(6))
+        if alt is not None:
+            below = gps.get(5) in (1, b"\x01")
+            s.append(("Altitude", f"{-alt if below else alt:.0f} m"))
+    if len(s) <= 2 and not info:
+        s.append(("EXIF", "Aucune information EXIF dans ce fichier"))
+    result["summary"] = s
+
+    def named(d: dict, names: dict) -> list[tuple[str, str]]:
+        out = []
+        for tag in sorted(d):
+            if tag in (0x8769, 0x8825, 0xA005):
+                continue   # pointeurs vers les sous-répertoires
+            name = names.get(tag, f"0x{tag:04X}")
+            value = d[tag]
+            if tag in _EXIF_SKIP_BINARY and isinstance(value, bytes):
+                text = _user_comment(value) if tag == 0x9286 else f"(données binaires, {len(value)} octets)"
+            else:
+                text = _exif_text(value)
+            out.append((name, text))
+        return out
+
+    groups = []
+    if ifd0:
+        groups.append(("Image (IFD0)", named(ifd0, ExifTags.TAGS)))
+    if sub:
+        groups.append(("Exif", named(sub, ExifTags.TAGS)))
+    if gps:
+        groups.append(("GPS", named(gps, ExifTags.GPSTAGS)))
+    if info:
+        groups.append(("Autres métadonnées du fichier", sorted(info.items())))
+    result["groups"] = groups
+    return result
+
+
+def _read_exif_tool(tool: str, path: str) -> dict:
+    """Repli sur exiftool (HEIC, RAW non lisibles par Pillow)."""
+    result: dict = {"summary": [], "groups": [], "gps": None, "error": ""}
+    try:
+        out = subprocess.run([tool, "-json", "-G1", "-s", "--", path], capture_output=True,
+                             timeout=30, check=False).stdout
+        data = json.loads(out.decode("utf-8", "replace"))[0]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+        result["error"] = f"Lecture des informations impossible : {exc}"
+        return result
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for k, v in data.items():
+        if k == "SourceFile":
+            continue
+        g, _, name = k.partition(":")
+        if not name:
+            g, name = "Fichier", k
+        groups.setdefault(g, []).append((name, _exif_text(v) if not isinstance(v, (int, float)) else str(v)))
+    flat = {name: val for lst in groups.values() for name, val in lst}
+    for key, label in (("Model", "Appareil"), ("LensModel", "Objectif"), ("DateTimeOriginal", "Date de prise de vue"),
+                       ("ExposureTime", "Temps de pose"), ("FNumber", "Ouverture"), ("ISO", "Sensibilité"),
+                       ("FocalLength", "Focale"), ("ImageSize", "Dimensions"), ("GPSPosition", "Coordonnées GPS")):
+        if key in flat:
+            result["summary"].append((label, flat[key]))
+    result["groups"] = sorted(groups.items())
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Presse-papiers (image) : wl-copy, xclip, ou GTK en processus auxiliaire
+# ---------------------------------------------------------------------------
+
+CLIPBOARD_MAX_SIDE = 8000
+
+# Processus auxiliaire : garde l'image dans le presse-papiers (X11 / XWayland) jusqu'à ce
+# qu'une autre application en prenne possession. Tk ne sait copier que du texte.
+_GTK_CLIP_HELPER = r"""
+import sys
+import gi
+gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
+data = sys.stdin.buffer.read()
+loader = GdkPixbuf.PixbufLoader.new_with_type("png"); loader.write(data); loader.close()
+cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+cb.set_image(loader.get_pixbuf())
+armed = [False]
+def changed(*_):
+    if armed[0]:
+        Gtk.main_quit()
+cb.connect("owner-change", changed)
+GLib.timeout_add(800, lambda: armed.__setitem__(0, True) or False)
+GLib.timeout_add_seconds(6 * 3600, lambda: Gtk.main_quit() or False)
+print("ok", flush=True)
+Gtk.main()
+"""
+
+
+def image_to_png(path: str) -> bytes:
+    img = load_pil_image(path, CLIPBOARD_MAX_SIDE, CLIPBOARD_MAX_SIDE)
+    if img.mode not in ("RGB", "RGBA", "L", "LA"):
+        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+    buf = io.BytesIO()
+    img.save(buf, "PNG", compress_level=3)
+    return buf.getvalue()
+
+
+def clipboard_methods() -> list[str]:
+    methods = []
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        methods.append("wl-copy")
+    if os.environ.get("DISPLAY") and shutil.which("xclip"):
+        methods.append("xclip")
+    if os.environ.get("DISPLAY"):
+        methods.append("gtk")
+    return methods
+
+
+def copy_png_to_clipboard(png: bytes) -> str:
+    """Place une image PNG dans le presse-papiers. Renvoie la méthode utilisée, lève OSError sinon."""
+    errors = []
+    for method in clipboard_methods():
+        try:
+            if method == "wl-copy":
+                cmd, env = ["wl-copy", "--type", "image/png"], None
+            elif method == "xclip":
+                cmd, env = ["xclip", "-selection", "clipboard", "-t", "image/png", "-i"], None
+            else:
+                cmd = [sys.executable, "-c", _GTK_CLIP_HELPER]
+                env = dict(os.environ, GDK_BACKEND="x11")
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, env=env, start_new_session=True,
+                                    cwd=os.path.expanduser("~"))
+            proc.stdin.write(png)
+            proc.stdin.close()
+            if method == "gtk":
+                if proc.stdout.readline().strip() != b"ok":
+                    raise OSError("GTK indisponible (paquets python3-gi et gir1.2-gtk-3.0)")
+            else:
+                try:
+                    if proc.wait(timeout=5) != 0:
+                        raise OSError(f"{method} a échoué")
+                except subprocess.TimeoutExpired:
+                    pass   # xclip reste actif pour servir le presse-papiers
+            proc.stdout.close()
+            return method
+        except (OSError, ValueError) as exc:
+            errors.append(f"{method} : {exc}")
+    raise OSError("aucun moyen de copier une image dans le presse-papiers"
+                  + (" (" + " ; ".join(errors) + ")" if errors else ""))
+
+
+def resolve_photo_file(library, photo: Photo, original: bool = False) -> Optional[str]:
+    """Fichier d'une photo sur le disque : version affichée (par défaut) ou original."""
+    if photo.source == "folder":
+        return photo.image_path if library.original_exists(photo) else None
+    order = (photo.original_path, photo.image_path) if original else (photo.image_path, photo.original_path)
+    for mp in order:
+        if mp:
+            real = library.existing(library.to_linux(mp))
+            if real:
+                return real
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Copie vers un dossier de destination (les fichiers sources ne sont que lus)
+# ---------------------------------------------------------------------------
+
+_BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(name: str, fallback: str = "Sans titre") -> str:
+    """Nom de fichier ou de dossier valide aussi sur les clés USB (FAT/exFAT)."""
+    name = _BAD_NAME_CHARS.sub("_", safe_text(name)).strip().rstrip(".").strip()
+    return name[:120] or fallback
+
+
+def unique_path(directory: str, name: str, taken: Optional[set[str]] = None) -> str:
+    """Chemin libre dans directory : « nom.jpg », sinon « nom (2).jpg »… (aucun écrasement)."""
+    stem, ext = os.path.splitext(name)
+    taken = taken if taken is not None else set()
+    n = 1
+    while True:
+        candidate = name if n == 1 else f"{stem} ({n}){ext}"
+        path = os.path.join(directory, candidate)
+        if candidate.lower() not in taken and not os.path.lexists(path):
+            taken.add(candidate.lower())
+            return path
+        n += 1
+
+
+class CopyTask:
+    """Copie des photos vers un dossier, dans un thread. Ne remplace jamais un fichier.
+
+    items : liste (photo, sous-dossier relatif). resolve(photo) renvoie le fichier source
+    (ou None s'il est introuvable) ; il est appelé dans le thread, car un disque externe
+    peut être lent. Les fichiers sources ne sont ouverts qu'en lecture.
+    """
+
+    def __init__(self, items: list[tuple[Photo, str]], resolve: Callable[[Photo], Optional[str]],
+                 dest: str, forbidden: list[str]):
+        self.items = items
+        self.resolve = resolve
+        self.dest = dest
+        self.forbidden = [r for r in forbidden if r]
+        self.cancelled = threading.Event()
+        self.phase = "prepare"
+        self.total = len(items)
+        self.done = 0
+        self.copied = 0
+        self.bytes_done = 0
+        self.total_bytes = 0
+        self.missing: list[str] = []
+        self.failed: list[str] = []
+        self.created_dirs: set[str] = set()
+        self.finished = False
+        self.fatal = ""
+
+    def check_destination(self) -> None:
+        """Contrôles rapides (dans le thread de l'interface) ; lève une erreur explicite."""
+        if not os.path.isdir(self.dest):
+            raise OSError(f"Le dossier de destination n'existe pas :\n{self.dest}")
+        for root in self.forbidden:
+            if is_inside(self.dest, root):
+                raise PermissionError(
+                    "La destination se trouve dans une bibliothèque ou un dossier consulté, qui sont "
+                    f"en lecture seule :\n{root}\n\nChoisissez un autre dossier.")
+        if not os.access(self.dest, os.W_OK | os.X_OK):
+            raise PermissionError(f"Vous n'avez pas le droit d'écrire dans :\n{self.dest}")
+
+    def _assert_target(self, path: str) -> None:
+        for root in self.forbidden:
+            if is_inside(path, root):
+                raise PermissionError(f"Écriture refusée dans {root}")
+
+    def run(self) -> None:
+        try:
+            jobs: list[tuple[str, str, str]] = []      # source, sous-dossier, libellé
+            for photo, subdir in self.items:
+                if self.cancelled.is_set():
+                    return
+                label = photo.filename or photo.label
+                src = self.resolve(photo)
+                if not src:
+                    self.missing.append(label)
+                    continue
+                try:
+                    self.total_bytes += os.path.getsize(src)
+                except OSError:
+                    self.missing.append(label)
+                    continue
+                jobs.append((src, subdir, label))
+                self.done += 1
+            free = shutil.disk_usage(self.dest).free
+            if self.total_bytes > free:
+                self.fatal = (f"Espace insuffisant sur la destination : {format_size(self.total_bytes)} "
+                              f"nécessaires, {format_size(free)} disponibles.")
+                return
+            self.phase = "copy"
+            self.total = len(jobs)
+            self.done = 0
+            taken: dict[str, set[str]] = {}
+            for src, subdir, label in jobs:
+                if self.cancelled.is_set():
+                    break
+                self._copy_one(src, subdir, label, taken)
+                self.done += 1
+        except Exception as exc:   # erreur inattendue : signalée sans planter l'application
+            self.fatal = str(exc)
+        finally:
+            self.finished = True
+
+    def _copy_one(self, src: str, subdir: str, label: str, taken: dict[str, set[str]]) -> None:
+        directory = os.path.join(self.dest, subdir) if subdir else self.dest
+        tmp = None
+        try:
+            self._assert_target(directory)
+            if not os.path.isdir(directory):
+                os.makedirs(directory)
+                self.created_dirs.add(directory)
+            names = taken.setdefault(directory, set())
+            target = unique_path(directory, safe_filename(os.path.basename(src), "image"), names)
+            tmp = target + ".iphotor-part"
+            st = os.stat(src)
+            with open(src, "rb") as fsrc, open(tmp, "xb") as fdst:
+                while True:
+                    if self.cancelled.is_set():
+                        raise InterruptedError
+                    chunk = fsrc.read(1 << 20)
+                    if not chunk:
+                        break
+                    fdst.write(chunk)
+                    self.bytes_done += len(chunk)
+            try:
+                os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+            except OSError:
+                pass
+            if os.path.lexists(target):            # apparu entre-temps : jamais d'écrasement
+                target = unique_path(directory, os.path.basename(target), names)
+            os.rename(tmp, target)
+            tmp = None
+            self.copied += 1
+        except InterruptedError:
+            pass
+        except OSError as exc:
+            self.failed.append(f"{label} : {exc.strerror or exc}")
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # Interface graphique
 # ---------------------------------------------------------------------------
 
 COLORS = {
+    "favorite": "#ff5c7a",
     "bg": "#1f2124",
     "panel": "#2a2d31",
     "tile": "#2f3237",
@@ -2012,8 +2633,14 @@ class PhotoViewer:
         self.btn_next.pack(side="left", padx=(6, 0))
         self.pos_label = ttk.Label(bar, text="", style="Panel.TLabel")
         self.pos_label.pack(side="left", padx=12)
-        self.btn_open = ttk.Button(bar, text="Ouvrir avec l'application par défaut", command=self.open_external)
+        self.btn_open = ttk.Button(bar, text="Ouvrir ↗", command=self.open_external)
         self.btn_open.pack(side="right")
+        ttk.Button(bar, text="Copier vers…", command=lambda: self._act("to")).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="Copier", command=lambda: self._act("copy")).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="EXIF", command=lambda: self._act("exif")).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="🏷 Tags", command=lambda: self._act("tags")).pack(side="right", padx=(0, 6))
+        self.btn_fav = ttk.Button(bar, text="♡ Favori", width=11, command=lambda: self._act("fav"))
+        self.btn_fav.pack(side="right", padx=(0, 6))
 
         # Informations
         info = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 8))
@@ -2024,6 +2651,8 @@ class PhotoViewer:
         self.info_details.pack(anchor="w", pady=(2, 0))
         self.info_comment = ttk.Label(info, text="", style="Muted.TLabel", justify="left")
         self.info_comment.pack(anchor="w", pady=(2, 0))
+        self.info_annot = ttk.Label(info, text="", style="Favorite.TLabel", justify="left")
+        self.info_annot.pack(anchor="w", pady=(2, 0))
 
         # Image
         self.canvas = tk.Canvas(self.win, bg="#111214", highlightthickness=0)
@@ -2037,7 +2666,38 @@ class PhotoViewer:
         self.win.bind("<Escape>", lambda e: self.close())
         self.win.bind("<Home>", lambda e: self.show_index(0))
         self.win.bind("<End>", lambda e: self.show_index(len(self.ids) - 1))
+        for seq, action in (("<Control-c>", "copy"), ("<Control-C>", "path"), ("<Control-s>", "to"),
+                            ("<KeyPress-f>", "fav"), ("<KeyPress-t>", "tags"), ("<KeyPress-i>", "exif")):
+            self.win.bind(seq, lambda e, a=action: self._act(a))
+        self.canvas.bind("<Button-3>", self._on_menu)
         self._poll()
+
+    # -- actions sur la photo affichée ---------------------------------------------
+    def _act(self, action: str) -> None:
+        p = self.photo
+        if p is None:
+            return
+        app = self.app
+        {"copy": lambda: app.copy_image(p, self.win), "path": lambda: app.copy_path(p),
+         "to": lambda: app.copy_photo_to(p, self.win), "fav": lambda: app.toggle_favorite(p, self.win),
+         "tags": lambda: app.edit_tags(p, self.win), "exif": lambda: app.show_exif(p, self.win)}[action]()
+
+    def _on_menu(self, event) -> None:
+        if self.photo is not None:
+            self.app.photo_menu(self.photo, self.win, event.x_root, event.y_root)
+
+    def refresh_annotations(self) -> None:
+        p = self.photo
+        if p is None:
+            self.info_annot.config(text="")
+            return
+        fav = self.app.is_favorite(p)
+        self.btn_fav.config(text="♥ Favori" if fav else "♡ Favori")
+        parts = ["♥ Dans vos favoris"] if fav else []
+        tags = self.app.tags_of(p)
+        if tags:
+            parts.append("🏷 Tags : " + ", ".join(tags))
+        self.info_annot.config(text="     ".join(parts))
 
     # -- navigation --------------------------------------------------------
     def show(self, ids: list[int], index: int) -> None:
@@ -2082,9 +2742,11 @@ class PhotoViewer:
             self.info_title.config(text="Photo introuvable dans l'index")
             self.info_details.config(text="")
             self.info_comment.config(text="")
+            self.info_annot.config(text="")
             return
         self.win.title(f"{p.filename or p.label} — iphotor")
         self.info_title.config(text=p.caption or p.filename)
+        self.refresh_annotations()
         if p.source == "folder":
             details = [f"Dossier : {p.folder or '.'}"]
             if p.date is not None:
@@ -2377,6 +3039,301 @@ class LibraryDialog:
         self.win.destroy()
 
 
+class _Dialog:
+    """Base des petites fenêtres modales."""
+
+    def __init__(self, app: "MainWindow", parent, title: str):
+        self.app = app
+        self.win = tk.Toplevel(parent)
+        self.win.title(title)
+        self.win.configure(bg=COLORS["panel"])
+        self.win.transient(parent)
+        self.win.resizable(True, False)
+        self.body = ttk.Frame(self.win, style="Panel.TFrame", padding=16)
+        self.body.pack(fill="both", expand=True)
+
+    def _grab(self) -> None:
+        try:
+            self.win.wait_visibility()
+            self.win.grab_set()
+        except tk.TclError:
+            pass
+        self.win.focus_force()
+
+
+class TagDialog(_Dialog):
+    """Choix des tags d'une photo : tags existants (cases) et nouveaux tags."""
+
+    def __init__(self, app: "MainWindow", parent, photo: Photo, current: list[str], known: list[str]):
+        super().__init__(app, parent, "Tags — iphotor")
+        self.result: Optional[list[str]] = None
+        b = self.body
+        ttk.Label(b, text="Tags de la photo", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(b, text=safe_text(photo.filename or photo.label), style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
+        self.vars: dict[str, tk.BooleanVar] = {}
+        names = sorted(set(known) | set(current), key=normalize_text)
+        if names:
+            ttk.Label(b, text="Tags existants :", style="Panel.TLabel").pack(anchor="w")
+            box = ttk.Frame(b, style="Panel.TFrame")
+            box.pack(anchor="w", fill="x", pady=(2, 10))
+            cols = 3
+            for i, name in enumerate(names):
+                var = tk.BooleanVar(value=name in current)
+                self.vars[name] = var
+                ttk.Checkbutton(box, text=name, variable=var).grid(row=i // cols, column=i % cols,
+                                                                   sticky="w", padx=(0, 18), pady=1)
+        ttk.Label(b, text="Nouveaux tags (séparés par des virgules) :", style="Panel.TLabel").pack(anchor="w")
+        self.new_var = tk.StringVar()
+        entry = ttk.Entry(b, textvariable=self.new_var, width=48)
+        entry.pack(anchor="w", fill="x", pady=(2, 12))
+        btns = ttk.Frame(b, style="Panel.TFrame")
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Enregistrer", command=self.ok).pack(side="right")
+        ttk.Button(btns, text="Annuler", command=self.win.destroy).pack(side="right", padx=(0, 6))
+        self.win.bind("<Return>", lambda e: self.ok())
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self._grab()
+        entry.focus_set()
+        self.win.wait_window()
+
+    def ok(self) -> None:
+        tags = [name for name, var in self.vars.items() if var.get()]
+        tags += [t for t in (clean_tag(x) for x in self.new_var.get().split(",")) if t]
+        self.result = tags
+        self.win.destroy()
+
+
+class ExifDialog:
+    """Fenêtre des informations EXIF d'une photo (non modale)."""
+
+    def __init__(self, app: "MainWindow", parent, photo: Photo, path: str, data: dict):
+        self.app = app
+        self.data = data
+        self.path = path
+        self.win = tk.Toplevel(parent)
+        self.win.title(f"Informations — {photo.filename or photo.label}")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.geometry("640x620")
+        self.win.minsize(420, 300)
+        top = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 10))
+        top.pack(side="top", fill="x")
+        ttk.Label(top, text=safe_text(photo.filename or photo.label), style="Title.TLabel").pack(anchor="w")
+        try:
+            size = format_size(os.path.getsize(path))
+        except OSError:
+            size = "?"
+        ttk.Label(top, text=f"{safe_text(path)}   ·   {size}", style="Muted.TLabel",
+                  wraplength=600, justify="left").pack(anchor="w")
+
+        btns = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 8))
+        btns.pack(side="bottom", fill="x")
+        ttk.Button(btns, text="Fermer", command=self.win.destroy).pack(side="right")
+        ttk.Button(btns, text="Copier le texte", command=self.copy_text).pack(side="right", padx=(0, 6))
+        if data.get("gps"):
+            ttk.Button(btns, text="Voir sur une carte", command=self.open_map).pack(side="left")
+
+        frame = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 0))
+        frame.pack(side="top", fill="both", expand=True)
+        self.tree = ttk.Treeview(frame, columns=("v",), show="tree", selectmode="browse")
+        self.tree.column("#0", width=230, stretch=False)
+        self.tree.column("v", width=380, stretch=True)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("section", font=app.font_bold, foreground=COLORS["accent"])
+        self.tree.tag_configure("error", foreground=COLORS["missing"])
+
+        if data.get("error"):
+            self.tree.insert("", "end", text="⚠ " + data["error"], tags=("error",))
+        if data.get("summary"):
+            sec = self.tree.insert("", "end", text="Résumé", tags=("section",), open=True)
+            for label, value in data["summary"]:
+                self.tree.insert(sec, "end", text=label, values=(value,))
+        for group, items in data.get("groups", []):
+            sec = self.tree.insert("", "end", text=f"{group} ({len(items)})", tags=("section",), open=False)
+            for name, value in items:
+                self.tree.insert(sec, "end", text=name, values=(value,))
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.win.focus_force()
+
+    def as_text(self) -> str:
+        lines = [self.path, ""]
+        if self.data.get("error"):
+            lines.append(self.data["error"])
+        for label, value in self.data.get("summary", []):
+            lines.append(f"{label} : {value}")
+        for group, items in self.data.get("groups", []):
+            lines += ["", f"[{group}]"] + [f"{n} : {v}" for n, v in items]
+        return "\n".join(lines)
+
+    def copy_text(self) -> None:
+        self.win.clipboard_clear()
+        self.win.clipboard_append(self.as_text())
+        self.app._set_status("Informations copiées dans le presse-papiers (texte).")
+
+    def open_map(self) -> None:
+        lat, lon = self.data["gps"]
+        url = f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}#map=15/{lat:.6f}/{lon:.6f}"
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            messagebox.showerror("Carte", f"Impossible d'ouvrir le navigateur :\n{exc}", parent=self.win)
+
+
+class CopyDialog(_Dialog):
+    """Choix de la destination d'une copie."""
+
+    def __init__(self, app: "MainWindow", parent, what: str, summary: str, subdir_name: str,
+                 is_library: bool):
+        super().__init__(app, parent, "Copier vers un dossier — iphotor")
+        self.result: Optional[dict] = None
+        st = app.settings
+        b = self.body
+        ttk.Label(b, text=f"Copier {what}", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(b, text=summary, style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+        ttk.Label(b, text="Dossier de destination :", style="Panel.TLabel").pack(anchor="w")
+        row = ttk.Frame(b, style="Panel.TFrame")
+        row.pack(fill="x", pady=(2, 10))
+        default = st.copy_dest if st.copy_dest and os.path.isdir(st.copy_dest) else ""
+        self.dest_var = tk.StringVar(value=default)
+        self.entry = ttk.Entry(row, textvariable=self.dest_var, width=56)
+        self.entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Parcourir…", command=self.browse).pack(side="left", padx=(6, 0))
+        self.sub_var = tk.BooleanVar(value=bool(subdir_name))
+        self.subdir_name = subdir_name
+        if subdir_name:
+            ttk.Checkbutton(b, text=f"Créer un sous-dossier « {safe_filename(subdir_name)} »",
+                            variable=self.sub_var).pack(anchor="w")
+        self.orig_var = tk.BooleanVar(value=st.copy_original)
+        if is_library:
+            ttk.Label(b, text="Fichier copié :", style="Panel.TLabel").pack(anchor="w", pady=(8, 0))
+            ttk.Radiobutton(b, text="Version affichée (la version retouchée si elle existe)",
+                            variable=self.orig_var, value=False).pack(anchor="w")
+            ttk.Radiobutton(b, text="Fichier original (tel que sorti de l'appareil, RAW compris)",
+                            variable=self.orig_var, value=True).pack(anchor="w")
+        self.open_var = tk.BooleanVar(value=st.copy_open)
+        ttk.Checkbutton(b, text="Ouvrir le dossier de destination à la fin",
+                        variable=self.open_var).pack(anchor="w", pady=(8, 0))
+        ttk.Label(b, text="Les fichiers existants ne sont jamais remplacés : un numéro est ajouté au nom "
+                          "si besoin.\nLes fichiers d'origine ne sont ni modifiés ni déplacés.",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(12, 12))
+        btns = ttk.Frame(b, style="Panel.TFrame")
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Copier", command=self.ok).pack(side="right")
+        ttk.Button(btns, text="Annuler", command=self.win.destroy).pack(side="right", padx=(0, 6))
+        self.win.bind("<Return>", lambda e: self.ok())
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self._grab()
+        if not default:
+            self.win.after(50, self.browse)
+        self.win.wait_window()
+
+    def browse(self) -> None:
+        start = self.dest_var.get() or self.app.settings.copy_dest
+        if not start or not os.path.isdir(start):
+            start = os.path.expanduser("~")
+        path = filedialog.askdirectory(parent=self.win, title="Dossier de destination",
+                                       initialdir=start, mustexist=True)
+        if path:
+            self.dest_var.set(path)
+
+    def ok(self) -> None:
+        dest = os.path.expanduser(self.dest_var.get().strip())
+        if not dest:
+            messagebox.showwarning("Destination", "Choisissez un dossier de destination.", parent=self.win)
+            return
+        if not os.path.isdir(dest):
+            messagebox.showerror("Destination", f"Ce dossier n'existe pas :\n{dest}", parent=self.win)
+            return
+        dest = os.path.abspath(dest)
+        st = self.app.settings
+        st.copy_dest, st.copy_original, st.copy_open = dest, bool(self.orig_var.get()), bool(self.open_var.get())
+        st.save()
+        self.result = {"dest": dest, "subdir": self.subdir_name if self.sub_var.get() else "",
+                       "original": bool(self.orig_var.get()), "open": bool(self.open_var.get())}
+        self.win.destroy()
+
+
+class CopyProgress:
+    """Suivi d'une copie en cours (non modal : la navigation reste possible)."""
+
+    def __init__(self, app: "MainWindow", parent, task: CopyTask, title: str, open_dir: Optional[str]):
+        self.app = app
+        self.task = task
+        self.open_dir = open_dir
+        self.title = title
+        self.win = tk.Toplevel(parent)
+        self.win.title("Copie en cours — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+        b = ttk.Frame(self.win, style="Panel.TFrame", padding=16)
+        b.pack(fill="both", expand=True)
+        ttk.Label(b, text=title, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(b, text=f"vers {safe_text(task.dest)}", style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
+        self.bar = ttk.Progressbar(b, mode="determinate", length=420, maximum=max(1, task.total))
+        self.bar.pack(fill="x")
+        self.label = ttk.Label(b, text="Préparation…", style="Panel.TLabel")
+        self.label.pack(anchor="w", pady=(6, 10))
+        self.btn = ttk.Button(b, text="Annuler", command=self.cancel)
+        self.btn.pack(anchor="e")
+        threading.Thread(target=task.run, daemon=True, name="copie").start()
+        self.win.after(100, self._poll)
+
+    def cancel(self) -> None:
+        self.task.cancelled.set()
+        self.btn.state(["disabled"])
+        self.label.config(text="Annulation…")
+
+    def _poll(self) -> None:
+        t = self.task
+        if not self.win.winfo_exists():
+            return
+        if t.finished:
+            self._finish()
+            return
+        if not t.cancelled.is_set():
+            if t.phase == "prepare":
+                self.bar.configure(maximum=max(1, t.total), value=t.done + len(t.missing))
+                self.label.config(text=f"Recherche des fichiers… {format_count(t.done)} / {format_count(t.total)}")
+            else:
+                self.bar.configure(maximum=max(1, t.total_bytes), value=t.bytes_done)
+                self.label.config(text=f"{format_count(t.done)} / {format_count(t.total)} fichiers   ·   "
+                                       f"{format_size(t.bytes_done)} sur {format_size(t.total_bytes)}")
+        self.win.after(100, self._poll)
+
+    def _finish(self) -> None:
+        t = self.task
+        self.win.destroy()
+        if t.fatal:
+            messagebox.showerror("Copie impossible", t.fatal, parent=self.app.root)
+            self.app._set_status("Copie interrompue : " + t.fatal.splitlines()[0])
+            return
+        lines = [f"{plural(t.copied, 'fichier copié', 'fichiers copiés')} dans :\n{safe_text(t.dest)}"]
+        if t.cancelled.is_set():
+            lines.insert(0, "Copie annulée.")
+        if t.missing:
+            lines.append(f"\n{plural(len(t.missing), 'fichier introuvable', 'fichiers introuvables')} "
+                         "(disque débranché ou fichier absent) :\n  " + "\n  ".join(t.missing[:8])
+                         + ("\n  …" if len(t.missing) > 8 else ""))
+        if t.failed:
+            lines.append(f"\n{plural(len(t.failed), 'erreur')} :\n  " + "\n  ".join(t.failed[:8])
+                         + ("\n  …" if len(t.failed) > 8 else ""))
+        self.app._set_status(f"{self.title} : {plural(t.copied, 'fichier copié', 'fichiers copiés')}"
+                             + (f", {len(t.missing)} introuvable(s)" if t.missing else "")
+                             + (f", {len(t.failed)} erreur(s)" if t.failed else "") + ".")
+        if t.missing or t.failed or t.cancelled.is_set():
+            messagebox.showwarning("Copie terminée", "\n".join(lines), parent=self.app.root)
+        elif t.copied > 1:
+            messagebox.showinfo("Copie terminée", "\n".join(lines), parent=self.app.root)
+        if self.open_dir and t.copied and os.path.isdir(self.open_dir):
+            try:
+                subprocess.Popen(["xdg-open", self.open_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+
+
 class MainWindow:
     """Fenêtre principale : arborescence, grille de vignettes, recherche."""
 
@@ -2414,6 +3371,12 @@ class MainWindow:
         self._scan_queue: "queue.Queue[tuple]" = queue.Queue()
         self._scan_polling = False
 
+        # Favoris et tags (hors bibliothèque)
+        self.annotations = Annotations()
+        self._annot_sel = None          # "fav", ("tag", nom) ou None
+        self._tag_names: list[str] = []
+        self._tree_silent = False
+
         self._setup_style()
         self._build_ui()
         self._update_title()
@@ -2450,6 +3413,7 @@ class MainWindow:
         st.configure("TLabel", background=c["panel"], foreground=c["text"])
         st.configure("Panel.TLabel", background=c["panel"], foreground=c["text"])
         st.configure("Muted.TLabel", background=c["panel"], foreground=c["muted"])
+        st.configure("Favorite.TLabel", background=c["panel"], foreground=c["favorite"])
         st.configure("Title.TLabel", background=c["panel"], foreground=c["text"], font=self.font_title)
         st.configure("Status.TLabel", background=c["bg"], foreground=c["muted"], font=self.font_small, padding=(8, 3))
         st.configure("TButton", background=c["tile"], foreground=c["text"], padding=(10, 4), borderwidth=0)
@@ -2491,6 +3455,9 @@ class MainWindow:
         m_file.add_command(label="Ouvrir un dossier…", command=self.open_folder_dialog,
                            accelerator="Ctrl+Maj+O")
         m_file.add_separator()
+        m_file.add_command(label="Copier l'élément sélectionné vers un dossier…",
+                           command=self.copy_selected_tree_item, accelerator="Ctrl+Maj+S")
+        m_file.add_separator()
         m_file.add_command(label="Recharger", command=self.reload_current, accelerator="F5")
         m_file.add_command(label="Reconstruire l'index de la bibliothèque", command=self.rebuild_index)
         m_file.add_separator()
@@ -2508,6 +3475,11 @@ class MainWindow:
         root.bind_all("<Control-o>", lambda e: self.open_library_dialog())
         root.bind_all("<Control-O>", lambda e: self.open_folder_dialog())
         root.bind_all("<F5>", lambda e: self.reload_current())
+        root.bind("<Control-S>", lambda e: self.copy_selected_tree_item())
+        # Raccourcis portant sur la vignette survolée (fenêtre principale uniquement)
+        for seq, action in (("<Control-c>", "copy"), ("<Control-C>", "path"), ("<Control-s>", "to"),
+                            ("<KeyPress-f>", "fav"), ("<KeyPress-t>", "tags"), ("<KeyPress-i>", "exif")):
+            root.bind(seq, lambda e, a=action: self._grid_shortcut(a))
         root.bind_all("<Control-f>", lambda e: self.search_entry.focus_set())
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
@@ -2594,6 +3566,7 @@ class MainWindow:
         self.tree.tag_configure("folder", foreground="#d8c88a")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
+        self.tree.bind("<Button-3>", lambda e: self._on_tree_menu(e, self.tree))
 
         self.ftree_frame = ttk.Frame(left_pane, style="Panel.TFrame")
         self.ftree = ttk.Treeview(self.ftree_frame, columns=("n",), show="tree", selectmode="browse")
@@ -2607,6 +3580,7 @@ class MainWindow:
         self.ftree.tag_configure("folder", foreground="#d8c88a")
         self.ftree.tag_configure("error", foreground=COLORS["missing"])
         self.ftree.bind("<<TreeviewSelect>>", self._on_ftree_select)
+        self.ftree.bind("<Button-3>", lambda e: self._on_tree_menu(e, self.ftree))
         body.add(left_pane, minsize=220, width=460)
 
         grid_frame = ttk.Frame(body, style="Bg.TFrame")
@@ -2620,6 +3594,7 @@ class MainWindow:
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.canvas.bind("<Button-3>", self._on_canvas_menu)
         self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
         for widget in (self.canvas,):
             widget.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
@@ -2700,7 +3675,7 @@ class MainWindow:
     # -- modes : bibliothèque iPhoto / explorer un dossier ---------------------------
     # Attributs propres à chaque mode, sauvegardés et restaurés lors d'un changement de mode.
     _MODE_ATTRS = ("library", "cache", "loader", "photos", "view", "total", "page_no",
-                   "view_ids", "current_album_id")
+                   "view_ids", "current_album_id", "_annot_sel", "_tag_names")
 
     def _initial_folder_state(self) -> dict:
         lib = FolderLibrary("")
@@ -2709,6 +3684,7 @@ class MainWindow:
             "library": lib, "cache": cache, "loader": ThumbnailLoader(lib, cache),
             "photos": None, "view": View("empty", title="Explorer un dossier"), "total": 0,
             "page_no": 0, "view_ids": None, "current_album_id": None, "search": "",
+            "_annot_sel": None, "_tag_names": [],
             "title": "Explorer un dossier", "subtitle": "Aucun dossier ouvert", "status": "",
             "yview": 0.0,
             "grid_msg": ("Cliquez sur « Ouvrir un dossier… » pour afficher les images d'un dossier\n"
@@ -2751,6 +3727,7 @@ class MainWindow:
         self._apply_mode_widgets()
         if not restore:
             return
+        self._refresh_annotations_tree()
         self._update_nav()
         if self.photos is not None and self.view.kind != "empty" and self.total > 0:
             self.load_page()
@@ -2921,6 +3898,10 @@ class MainWindow:
                 self._mode_states[MODE_FOLDER]["grid_msg"] = (msg, COLORS["missing"])
             return
         self.folder.load(scanner)
+        if active:
+            self._annot_sel = None
+        else:
+            self._mode_states[MODE_FOLDER]["_annot_sel"] = None
         self._populate_ftree()
         summary = f"{plural(len(self.folder.photos), 'image')} dans {plural(scanner.dirs_seen, 'dossier')}"
         if scanner.errors:
@@ -2971,9 +3952,12 @@ class MainWindow:
                      tags=("error",))
             for i, (rel, _reason) in enumerate(f.errors):
                 t.insert("err", "end", iid=f"err:{i}", text=safe_text(rel), tags=("error",))
+        if self.mode == MODE_FOLDER:
+            self._refresh_annotations_tree()
 
     def _on_ftree_select(self, _event=None) -> None:
-        if self.mode != MODE_FOLDER or not self.folder.root or getattr(self, "_ftree_silent", False):
+        if (self.mode != MODE_FOLDER or not self.folder.root or getattr(self, "_ftree_silent", False)
+                or self._tree_silent):
             return
         sel = self.ftree.selection()
         if not sel:
@@ -2987,6 +3971,14 @@ class MainWindow:
             rel, reason = self.folder.errors[int(iid[4:])]
             self._set_status(f"⚠ Dossier inaccessible : {safe_text(rel)} — {reason}")
             return
+        if iid == "fav" or iid.startswith("tag:"):
+            self._show_annotation_view("fav" if iid == "fav" else ("tag", self._tag_names[int(iid[4:])]))
+            return
+        if iid == "sec:tags":
+            self.ftree.item(iid, open=True)
+            return
+        self._annot_sel = None
+        self.folder.only = None
         self.folder.subdir = iid[2:] or None
         self.folder.refresh()
         self.photos = self.folder
@@ -2996,6 +3988,9 @@ class MainWindow:
     def _folder_view(self) -> View:
         f = self.folder
         name = f.subdir.rpartition("/")[2] if f.subdir else (os.path.basename(f.root) or f.root)
+        if f.only is not None:
+            title = f"Recherche « {f.query} » dans {f.only_title}" if f.query else f.only_title
+            return View("folder", query=f.query, title=safe_text(title))
         title = f"Recherche « {f.query} » dans {name}" if f.query else f"Dossier : {name}"
         return View("folder", query=f.query, title=safe_text(title))
 
@@ -3222,6 +4217,7 @@ class MainWindow:
         n_top = add_children("sec:folders", None)
         t.set("sec:folders", "n", format_count(n_top))
         t.item("sec:events", open=False)
+        self._refresh_annotations_tree()
 
     @staticmethod
     def _homonym_hint(a: Album) -> str:
@@ -3249,12 +4245,17 @@ class MainWindow:
         self.tree.item(iid, open=not self.tree.item(iid, "open"))
 
     def _on_tree_select(self, _event=None) -> None:
-        if self.photos is None:
+        if self.photos is None or self._tree_silent or self.mode != MODE_LIBRARY:
             return
         sel = self.tree.selection()
         if not sel:
             return
         iid = sel[0]
+        if iid == "fav" or iid.startswith("tag:"):
+            self._show_annotation_view("fav" if iid == "fav" else ("tag", self._tag_names[int(iid[4:])]))
+            self._set_status(self.tree.item(iid, "text").strip())
+            return
+        self._annot_sel = None
         album_id = self._album_from_iid(iid)
         label = self.tree.item(iid, "text").strip()
         if label:
@@ -3277,6 +4278,7 @@ class MainWindow:
         elif iid.startswith("sec:"):
             self.current_album_id = None
             hint = {
+                "sec:tags": "Sélectionnez un tag pour afficher ses photos.",
                 "sec:albums": "Sélectionnez un album dans la liste à gauche.",
                 "sec:events": "Dépliez une année puis sélectionnez un événement.",
                 "sec:folders": "Dépliez un dossier pour voir ses albums.",
@@ -3432,6 +4434,9 @@ class MainWindow:
         if p.rating:
             c.create_text(x + TILE_W - 12, y + 18, text="★" * min(p.rating, 5), fill="#ffd34d",
                           anchor="e", font=self.font_small, tags=(tag,))
+        if self.is_favorite(p):
+            c.create_text(x + TILE_W - 12, y + THUMB_SIZE - 2, text="♥", fill=COLORS["favorite"],
+                          anchor="e", font=self.font_title, tags=(tag,))
         text_w = TILE_W - 18
         c.create_text(cx, y + THUMB_SIZE + 22, text=self._truncate(p.label, self.font, text_w),
                       fill=COLORS["text"], font=self.font, tags=(tag,))
@@ -3501,6 +4506,7 @@ class MainWindow:
                 state = self.tile_images.get(i)
                 if isinstance(state, dict) and state.get("status") == "error":
                     parts.append("⚠ image illisible")
+                parts += self._annotation_parts(p)
                 self.status_var.set("   ·   ".join(parts))
                 self.canvas.configure(cursor="hand2")
                 return
@@ -3514,8 +4520,16 @@ class MainWindow:
             state = self.tile_images.get(i)
             if isinstance(state, dict) and state.get("exists") is False:
                 parts.append("⚠ fichier introuvable")
+            parts += self._annotation_parts(p)
             self.status_var.set("   ·   ".join(parts))
         self.canvas.configure(cursor="hand2" if i is not None else "")
+
+    def _annotation_parts(self, p: Photo) -> list[str]:
+        parts = ["♥ favori"] if self.is_favorite(p) else []
+        tags = self.tags_of(p)
+        if tags:
+            parts.append("🏷 " + ", ".join(tags))
+        return parts
 
     def _on_canvas_motion(self, event) -> None:
         self._set_hover(self._index_at(event))
@@ -3617,6 +4631,487 @@ class MainWindow:
             if self.tree.exists("all"):
                 self.tree.selection_set("all")
 
+    # -- favoris et tags -----------------------------------------------------------
+    def _scope(self) -> str:
+        return FILES_SCOPE if self.mode == MODE_FOLDER else library_scope(self.library.root)
+
+    def _key(self, p: Photo) -> tuple[str, str]:
+        return photo_scope_key(p, self.library.root)
+
+    def is_favorite(self, p: Photo) -> bool:
+        try:
+            return self.annotations.is_favorite(*self._key(p))
+        except (sqlite3.Error, OSError):
+            return False
+
+    def tags_of(self, p: Photo) -> list[str]:
+        try:
+            return self.annotations.tags_of(*self._key(p))
+        except (sqlite3.Error, OSError):
+            return []
+
+    def _annotation_error(self, exc: Exception, parent=None) -> None:
+        messagebox.showerror("Favoris et tags",
+                             f"Enregistrement impossible dans {ANNOTATIONS_PATH} :\n{exc}",
+                             parent=parent or self.root)
+
+    def toggle_favorite(self, p: Photo, parent=None) -> None:
+        on = not self.is_favorite(p)
+        try:
+            self.annotations.set_favorite(*self._key(p), on)
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc, parent)
+            return
+        name = safe_text(p.filename or p.label)
+        self._set_status(f"♥ {name} ajoutée aux favoris." if on else f"{name} retirée des favoris.")
+        self._after_annotation_change()
+
+    def edit_tags(self, p: Photo, parent=None) -> None:
+        scope, key = self._key(p)
+        try:
+            current = self.annotations.tags_of(scope, key)
+            known = self.annotations.all_tags(scope)
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc, parent)
+            return
+        dlg = TagDialog(self, parent or self.root, p, current, known)
+        if dlg.result is None:
+            return
+        try:
+            self.annotations.set_tags(scope, key, dlg.result)
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc, parent)
+            return
+        tags = self.annotations.tags_of(scope, key)
+        self._set_status(f"Tags de {safe_text(p.filename or p.label)} : " + (", ".join(tags) if tags else "aucun"))
+        self._after_annotation_change()
+
+    def _annotation_keys(self, sel) -> set[str]:
+        scope = self._scope()
+        if sel == "fav":
+            return self.annotations.favorites(scope)
+        return self.annotations.keys_with_tag(scope, sel[1])
+
+    @staticmethod
+    def _annotation_title(sel) -> str:
+        return "Mes favoris" if sel == "fav" else f"Tag : {sel[1]}"
+
+    def _show_annotation_view(self, sel) -> None:
+        """Affiche les favoris (sel = "fav") ou les photos d'un tag (sel = ("tag", nom))."""
+        self._annot_sel = sel
+        self.current_album_id = None
+        try:
+            keys = self._annotation_keys(sel)
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc)
+            return
+        empty = ("Aucune photo dans vos favoris.\nClic droit sur une photo › « Ajouter aux favoris »."
+                 if sel == "fav" else "Aucune photo n'a ce tag.")
+        if self.mode == MODE_FOLDER:
+            f = self.folder
+            f.subdir = None
+            f.only = keys
+            f.only_title = self._annotation_title(sel)
+            f.refresh()
+            self.photos = f
+            self.set_view(self._folder_view(), message="" if f.count() else empty)
+        else:
+            view = View("keys", keys=tuple(sorted(keys)), title=self._annotation_title(sel))
+            self.set_view(view, message=empty if not keys else "")
+
+    def _annotation_count(self, keys: set[str]) -> int:
+        if not keys:
+            return 0
+        if self.mode == MODE_FOLDER:
+            return sum(1 for p in self.folder.photos if path_key(p.image_path) in keys)
+        try:
+            return self.photos.count(View("keys", keys=tuple(keys)))
+        except sqlite3.Error:
+            return 0
+
+    def _refresh_annotations_tree(self) -> None:
+        """(Re)crée les entrées « Mes favoris » et « Tags » de l'arborescence du mode courant."""
+        if self.mode == MODE_FOLDER:
+            t = self.ftree
+            if not self.folder.root or not t.exists("f:"):
+                return
+            pos = 1
+        else:
+            t = self.tree
+            if self.photos is None or not t.exists("all"):
+                return
+            pos = t.index("all") + 1
+        scope = self._scope()
+        try:
+            favs = self.annotations.favorites(scope)
+            tags = self.annotations.all_tags(scope)
+            tag_keys = [self.annotations.keys_with_tag(scope, tg) for tg in tags]
+        except (sqlite3.Error, OSError):
+            return
+        sel = t.selection()
+        was_open = t.exists("sec:tags") and t.item("sec:tags", "open")
+        for iid in ("fav", "sec:tags"):
+            if t.exists(iid):
+                t.delete(iid)
+        t.insert("", pos, iid="fav", text="♥  Mes favoris", values=(format_count(self._annotation_count(favs)),),
+                 tags=("section",))
+        self._tag_names = tags
+        if tags:
+            t.insert("", pos + 1, iid="sec:tags", text="🏷  Tags", values=(format_count(len(tags)),),
+                     tags=("section",), open=bool(was_open))
+            for i, (name, keys) in enumerate(zip(tags, tag_keys)):
+                t.insert("sec:tags", "end", iid=f"tag:{i}", text=name,
+                         values=(format_count(self._annotation_count(keys)),))
+        # Resélectionne l'entrée courante sans recharger la grille.
+        target = None
+        if self._annot_sel == "fav":
+            target = "fav"
+        elif isinstance(self._annot_sel, tuple) and self._annot_sel[1] in tags:
+            target = f"tag:{tags.index(self._annot_sel[1])}"
+        elif sel and t.exists(sel[0]) and sel[0] != "sec:tags" and not sel[0].startswith("tag:"):
+            target = sel[0]
+        if target:
+            self._select_silently(t, target)
+
+    def _select_silently(self, tree, iid: str) -> None:
+        self._tree_silent = True
+        tree.selection_set(iid)
+        tree.focus(iid)
+        tree.see(iid)
+        self.root.after_idle(lambda: setattr(self, "_tree_silent", False))
+
+    def _after_annotation_change(self) -> None:
+        self._refresh_annotations_tree()
+        if self._annot_sel is not None and self._annotation_view_active():
+            page, y = self.page_no, self.canvas.yview()[0]
+            self._show_annotation_view(self._annot_sel)
+            page = min(page, self.page_count() - 1)
+            if page > 0:
+                self.page_no = page
+                self.load_page()
+            self.canvas.yview_moveto(y)
+        elif self.page_photos:
+            self._layout()        # met à jour les badges ♥ des vignettes
+        if self.viewer is not None and self.viewer.win.winfo_exists():
+            self.viewer.refresh_annotations()
+
+    def _annotation_view_active(self) -> bool:
+        if self.mode == MODE_FOLDER:
+            return self.folder.only is not None and self.view.kind == "folder"
+        return self.view.kind == "keys"
+
+    # -- fichiers sources -------------------------------------------------------------
+    def source_file(self, p: Photo, original: bool = False) -> Optional[str]:
+        """Fichier à copier ou à analyser : version affichée ou original (lecture seule)."""
+        return resolve_photo_file(self.library, p, original)
+
+    # -- presse-papiers ----------------------------------------------------------------
+    def copy_image(self, p: Photo, parent=None) -> None:
+        parent = parent or self.root
+        if p.is_video:
+            messagebox.showinfo("Copier l'image", "Les vidéos ne peuvent pas être copiées comme image.\n"
+                                "Utilisez « Copier vers un dossier… » pour copier le fichier.", parent=parent)
+            return
+        path, _origin = self.library.find_display_file(p, for_thumbnail=False)
+        if not path:
+            messagebox.showwarning("Copier l'image", "Le fichier de cette photo est introuvable sur le disque.",
+                                   parent=parent)
+            return
+        name = safe_text(p.filename or p.label)
+        self._set_status(f"Copie de {name} dans le presse-papiers…")
+
+        def work():
+            png = image_to_png(path)
+            return copy_png_to_clipboard(png), len(png)
+
+        def done(result, error):
+            if error is not None:
+                detail = "format d'image non reconnu" if "cannot identify image file" in str(error) else str(error)
+                self._set_status(f"Copie de l'image impossible : {detail}")
+                messagebox.showerror(
+                    "Copier l'image",
+                    f"Impossible de placer l'image dans le presse-papiers :\n{detail}\n\n"
+                    "Installez le paquet wl-clipboard (Wayland) ou xclip (X11), ou utilisez "
+                    "« Copier le chemin du fichier ».", parent=parent)
+                return
+            self._set_status(f"Image copiée dans le presse-papiers : {name} — collez-la avec Ctrl+V "
+                             "dans une autre application.")
+
+        self._run_background(work, done)
+
+    def copy_path(self, p: Photo) -> None:
+        path = self.source_file(p) or self.library.to_linux(p.image_path)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(safe_text(path))
+        self._set_status(f"Chemin copié : {safe_text(path)}")
+
+    def _run_background(self, work: Callable, done: Callable) -> None:
+        """Exécute work() dans un thread puis done(résultat, erreur) dans le thread Tk."""
+        box: list = []
+
+        def runner():
+            try:
+                box.append((work(), None))
+            except Exception as exc:
+                box.append((None, exc))
+
+        th = threading.Thread(target=runner, daemon=True)
+        th.start()
+
+        def poll():
+            if box:
+                done(*box[0])
+            else:
+                self.root.after(60, poll)
+
+        self.root.after(60, poll)
+
+    # -- EXIF ---------------------------------------------------------------------------
+    def show_exif(self, p: Photo, parent=None) -> None:
+        parent = parent or self.root
+        path = self.source_file(p, original=True)
+        if not path:
+            messagebox.showwarning("Informations EXIF", "Le fichier de cette photo est introuvable sur le disque.",
+                                   parent=parent)
+            return
+        self._set_status(f"Lecture des informations de {safe_text(os.path.basename(path))}…")
+
+        def done(data, error):
+            if error is not None:
+                data = {"summary": [], "groups": [], "gps": None, "error": str(error)}
+            self._set_status("")
+            ExifDialog(self, parent, p, path, data)
+
+        self._run_background(lambda: read_exif(path), done)
+
+    # -- copie vers un dossier -------------------------------------------------------------
+    def _protected_roots(self) -> list[str]:
+        roots = {self.library.root}
+        for st in self._mode_states.values():
+            lib = st.get("library")
+            if lib is not None and lib.root:
+                roots.add(lib.root)
+        if self.folder.root:
+            roots.add(self.folder.root)
+        return [r for r in roots if r]
+
+    def copy_photo_to(self, p: Photo, parent=None) -> None:
+        name = safe_text(p.filename or p.label)
+        self._start_copy([(p, "")], f"« {name} »", "1 image" if p.source == "folder" else "1 photo", "", parent)
+
+    def _start_copy(self, items: list[tuple[Photo, str]], what: str, summary: str, subdir_name: str,
+                    parent=None) -> None:
+        parent = parent or self.root
+        if not items:
+            messagebox.showinfo("Copier", "Il n'y a aucune photo à copier.", parent=parent)
+            return
+        is_library = self.mode == MODE_LIBRARY
+        dlg = CopyDialog(self, parent, what, summary, subdir_name, is_library)
+        opts = dlg.result
+        if not opts:
+            return
+        sub = safe_filename(opts["subdir"]) if opts["subdir"] else ""
+        if sub:
+            top = unique_path(opts["dest"], sub)
+            sub = os.path.basename(top)
+            items = [(ph, os.path.join(sub, rel) if rel else sub) for ph, rel in items]
+        lib, original = self.library, opts["original"]
+        task = CopyTask(items, lambda ph: resolve_photo_file(lib, ph, original), opts["dest"],
+                        self._protected_roots())
+        try:
+            task.check_destination()
+        except OSError as exc:
+            messagebox.showerror("Copie impossible", str(exc), parent=parent)
+            return
+        open_dir = (os.path.join(opts["dest"], sub) if sub else opts["dest"]) if opts["open"] else None
+        CopyProgress(self, parent, task, f"Copie de {what}", open_dir)
+
+    def _photos_of_view(self, view: View) -> list[Photo]:
+        n = self.photos.count(view)
+        return self.photos.page(view, 0, n) if n else []
+
+    def copy_tree_item(self, iid: str) -> None:
+        """Copie l'album, l'événement, le dossier ou la liste correspondant à une entrée de l'arborescence."""
+        if self.photos is None:
+            return
+        try:
+            spec = self._copy_spec(iid)
+        except sqlite3.Error as exc:
+            messagebox.showerror("Copier", f"Lecture de l'index impossible : {exc}", parent=self.root)
+            return
+        if spec is None:
+            messagebox.showinfo("Copier", "Sélectionnez d'abord un album, un événement ou un dossier "
+                                "dans l'arborescence.", parent=self.root)
+            return
+        items, what, name = spec
+        n = len(items)
+        self._start_copy(items, what, plural(n, "photo" if self.mode == MODE_LIBRARY else "image"), name)
+
+    def _copy_spec(self, iid: str) -> Optional[tuple[list[tuple[Photo, str]], str, str]]:
+        """(photos avec leur sous-dossier relatif, description, nom du dossier à créer)."""
+        if self.mode == MODE_FOLDER:
+            f = self.folder
+            if iid == "fav" or iid.startswith("tag:"):
+                sel = "fav" if iid == "fav" else ("tag", self._tag_names[int(iid[4:])])
+                keys = self._annotation_keys(sel)
+                items = [(p, "") for p in f.photos if path_key(p.image_path) in keys]
+                title = self._annotation_title(sel)
+                return items, f"« {title} »", "Favoris" if sel == "fav" else sel[1]
+            if not iid.startswith("f:"):
+                return None
+            rel = iid[2:]
+            name = rel.rpartition("/")[2] if rel else (os.path.basename(f.root) or "Dossier")
+            items = []
+            for p in f.photos:
+                if rel and not (p.folder == rel or p.folder.startswith(rel + "/")):
+                    continue
+                sub = p.folder[len(rel):].lstrip("/") if rel else p.folder
+                items.append((p, "/".join(safe_filename(x) for x in sub.split("/")) if sub else ""))
+            items.sort(key=lambda it: natural_key(f"{it[1]}/{it[0].filename}"))
+            return items, f"le dossier « {safe_text(name)} »", safe_text(name)
+
+        am = self.albums
+        if iid == "all":
+            return [(p, "") for p in self._photos_of_view(View("all"))], "toutes les photos", "Toutes les photos"
+        if iid == "fav" or iid.startswith("tag:"):
+            sel = "fav" if iid == "fav" else ("tag", self._tag_names[int(iid[4:])])
+            view = View("keys", keys=tuple(self._annotation_keys(sel)))
+            title = self._annotation_title(sel)
+            return ([(p, "") for p in self._photos_of_view(view)], f"« {title} »",
+                    "Favoris" if sel == "fav" else sel[1])
+        if iid == "search":
+            view = self._search_view()
+            return [(p, "") for p in self._photos_of_view(view)], "les résultats de la recherche", view.title
+        if iid.startswith("y:"):
+            ys = iid[2:]
+            year = None if ys == "none" else int(ys)
+            items = []
+            for y, events in am.events_by_year():
+                if y == year:
+                    for e in events:
+                        items += [(p, safe_filename(e.name)) for p in self._photos_of_view(View("album", album_id=e.id))]
+            label = f"Événements {ys}" if year is not None else "Événements sans date"
+            return items, f"les événements de {ys}" if year is not None else "les événements sans date", label
+        album_id = self._album_from_iid(iid)
+        a = am.get(album_id) if album_id is not None else None
+        if a is None:
+            return None
+        if a.kind == KIND_FOLDER:
+            items: list[tuple[Photo, str]] = []
+
+            def walk(folder: Album, rel: str, seen: set[int]) -> None:
+                for child in am.children(folder.id):
+                    if child.id in seen:
+                        continue
+                    seen.add(child.id)
+                    sub = os.path.join(rel, safe_filename(child.name)) if rel else safe_filename(child.name)
+                    if child.kind == KIND_FOLDER:
+                        walk(child, sub, seen)
+                    else:
+                        items.extend((p, sub) for p in self._photos_of_view(View("album", album_id=child.id)))
+
+            walk(a, "", {a.id})
+            return items, f"le dossier « {a.name} »", a.name
+        kind = "l'événement" if a.kind == KIND_EVENT else "l'album"
+        return ([(p, "") for p in self._photos_of_view(View("album", album_id=a.id))],
+                f"{kind} « {a.name} »", a.name)
+
+    def copy_selected_tree_item(self) -> None:
+        tree = self.ftree if self.mode == MODE_FOLDER else self.tree
+        sel = tree.selection()
+        self.copy_tree_item(sel[0] if sel else "")
+
+    # -- menus contextuels ------------------------------------------------------------------
+    def photo_menu(self, p: Photo, parent, x: int, y: int, open_cmd: Optional[Callable] = None) -> None:
+        m = tk.Menu(parent, tearoff=False)
+        if open_cmd is not None:
+            m.add_command(label="Ouvrir", command=open_cmd)
+            m.add_separator()
+        m.add_command(label="Copier l'image", command=lambda: self.copy_image(p, parent), accelerator="Ctrl+C")
+        m.add_command(label="Copier le chemin du fichier", command=lambda: self.copy_path(p),
+                      accelerator="Ctrl+Maj+C")
+        m.add_command(label="Copier vers un dossier…", command=lambda: self.copy_photo_to(p, parent),
+                      accelerator="Ctrl+S")
+        m.add_separator()
+        fav = self.is_favorite(p)
+        m.add_command(label="♥  Retirer des favoris" if fav else "♡  Ajouter aux favoris",
+                      command=lambda: self.toggle_favorite(p, parent), accelerator="F")
+        m.add_command(label="🏷  Tags…", command=lambda: self.edit_tags(p, parent), accelerator="T")
+        m.add_separator()
+        m.add_command(label="Informations EXIF…", command=lambda: self.show_exif(p, parent), accelerator="I")
+        try:
+            m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    def _on_canvas_menu(self, event) -> None:
+        i = self._index_at(event)
+        if i is None:
+            return
+        self._set_hover(i)
+        p = self.page_photos[i]
+        absolute = self.page_no * PAGE_SIZE + i
+        self.photo_menu(p, self.root, event.x_root, event.y_root, lambda: self.open_viewer(absolute))
+
+    def _hovered_photo(self) -> Optional[Photo]:
+        if self.hover_index is not None and self.hover_index < len(self.page_photos):
+            return self.page_photos[self.hover_index]
+        return None
+
+    def _grid_shortcut(self, action: str) -> None:
+        """Raccourcis de la fenêtre principale : ils portent sur la vignette survolée."""
+        if self._focus_in_entry():
+            return
+        p = self._hovered_photo()
+        if p is None:
+            self._set_status("Placez le pointeur sur une vignette pour utiliser ce raccourci.")
+            return
+        {"copy": self.copy_image, "path": lambda ph: self.copy_path(ph), "to": self.copy_photo_to,
+         "fav": self.toggle_favorite, "tags": self.edit_tags, "exif": self.show_exif}[action](p)
+
+    def _on_tree_menu(self, event, tree) -> None:
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        if self.mode == MODE_FOLDER:
+            ok = iid.startswith("f:") or iid == "fav" or iid.startswith("tag:")
+        else:
+            ok = (iid in ("all", "fav", "search") or iid.startswith("tag:") or iid.startswith("y:")
+                  or self._album_from_iid(iid) is not None)
+        if not ok:
+            return
+        label = tree.item(iid, "text").strip().lstrip("📷🖼📅📁🗂♥🏷🔍⚙ ").strip()
+        if len(label) > 50:
+            label = label[:49] + "…"
+        m = tk.Menu(tree, tearoff=False)
+        m.add_command(label=f"Copier « {label} » vers un dossier…", command=lambda: self.copy_tree_item(iid))
+        if iid.startswith("tag:"):
+            name = self._tag_names[int(iid[4:])]
+            m.add_separator()
+            m.add_command(label=f"Retirer le tag « {name} » de toutes les photos",
+                          command=lambda: self.delete_tag(name))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def delete_tag(self, name: str) -> None:
+        scope = self._scope()
+        keys = self.annotations.keys_with_tag(scope, name)
+        if not messagebox.askyesno("Retirer un tag",
+                                   f"Retirer le tag « {name} » de {plural(len(keys), 'photo')} ?\n"
+                                   "Les photos elles-mêmes ne sont pas modifiées.", parent=self.root):
+            return
+        try:
+            for k in keys:
+                self.annotations.set_tags(scope, k, [t for t in self.annotations.tags_of(scope, k) if t != name])
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc)
+            return
+        if self._annot_sel == ("tag", name):
+            self._annot_sel = "fav"
+        self._after_annotation_change()
+
     # -- menus -------------------------------------------------------------------
     def clear_thumb_cache(self) -> None:
         what = ("Les dossiers consultés ne sont pas concernés." if self.mode == MODE_FOLDER
@@ -3663,7 +5158,12 @@ class MainWindow:
             "Raccourcis clavier",
             "Fenêtre principale :\n"
             "  Ctrl+O : ouvrir une autre bibliothèque\n  Ctrl+Maj+O : ouvrir un dossier\n"
-            "  Ctrl+F : rechercher\n  F5 : recharger\n  Page préc. / Page suiv. : changer de page\n  Ctrl+Q : quitter\n\n"
+            "  Ctrl+F : rechercher\n  F5 : recharger\n  Page préc. / Page suiv. : changer de page\n"
+            "  Ctrl+Maj+S : copier l'album, l'événement ou le dossier sélectionné\n  Ctrl+Q : quitter\n\n"
+            "Sur la vignette survolée (ou dans la visionneuse) :\n"
+            "  Ctrl+C : copier l'image dans le presse-papiers\n  Ctrl+Maj+C : copier le chemin du fichier\n"
+            "  Ctrl+S : copier vers un dossier\n  F : ajouter aux favoris / retirer\n  T : tags\n"
+            "  I : informations EXIF\n  Clic droit : menu de la photo\n\n"
             "Visionneuse :\n"
             "  ← / → (ou Espace) : photo précédente / suivante\n  Début / Fin : première / dernière photo\n"
             "  Échap : fermer",
@@ -3675,7 +5175,8 @@ class MainWindow:
             f"iphotor {APP_VERSION}\n\nExplorateur en lecture seule de bibliothèques iPhoto / Photos\n"
             "et de dossiers d'images.\n"
             "Les bibliothèques et les dossiers consultés ne sont jamais modifiés : l'index et les\n"
-            f"miniatures sont stockés dans\n{CACHE_DIR}",
+            f"miniatures sont stockés dans\n{CACHE_DIR}\n\n"
+            f"Favoris et tags :\n{ANNOTATIONS_PATH}",
             parent=self.root)
 
     def _set_status(self, text: str) -> None:
@@ -3689,6 +5190,7 @@ class MainWindow:
                 st["loader"].shutdown()
         self.loader.shutdown()
         self._close_db()
+        self.annotations.close()
         self.root.destroy()
 
 

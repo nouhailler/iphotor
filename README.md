@@ -3,9 +3,11 @@
 Application de bureau Python/Tkinter qui permet de parcourir sous Debian 13, **en lecture
 seule**, une ancienne bibliothèque iPhoto (iPhoto 9.x) ou une bibliothèque
 de l'app Photos 1 à 4 (macOS 10.10 à 10.14), ainsi que **n'importe quel dossier d'images**
-de l'ordinateur ou d'un disque externe.
+de l'ordinateur ou d'un disque externe. Les photos peuvent être copiées (presse-papiers ou
+dossier de destination), marquées comme favorites, classées par tags, et leurs informations
+EXIF affichées.
 
-Version actuelle : **1.3.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
+Version actuelle : **1.4.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
 [CONTEXT.md](CONTEXT.md) pour le contexte, les contraintes et la structure des bibliothèques
 (AlbumData.xml d'iPhoto, base SQLite de Photos).
 
@@ -31,6 +33,8 @@ Version actuelle : **1.3.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 | `python3-pil`          | Pillow, décodage des images           |
 | `python3-pil.imagetk`  | affichage des images Pillow dans Tk   |
 | `python3-gi`, `gir1.2-gdkpixbuf-2.0`, `heif-gdk-pixbuf` | facultatifs : photos HEIC (iPhone) |
+| `gir1.2-gtk-3.0`, ou `wl-clipboard` / `xclip` | facultatifs : copier une image dans le presse-papiers |
+| `libimage-exiftool-perl` | facultatif : informations EXIF des fichiers HEIC                |
 
 `plistlib`, `sqlite3`, `threading`… font partie de la bibliothèque standard.
 
@@ -38,11 +42,11 @@ Version actuelle : **1.3.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 
 ### Option A : paquet .deb (recommandé)
 
-Téléchargez `iphotor_1.3.0_all.deb` depuis la
+Téléchargez `iphotor_1.4.0_all.deb` depuis la
 [page des releases](../../releases), puis :
 
 ```bash
-sudo apt install ./iphotor_1.3.0_all.deb
+sudo apt install ./iphotor_1.4.0_all.deb
 ```
 
 `apt` installe automatiquement les dépendances. L'application apparaît dans le menu
@@ -156,6 +160,48 @@ passe de l'un à l'autre.
   la date de modification, la taille, les **dimensions** et le **chemin d'accès** de l'image.
 - **F5** (ou *Fichier › Recharger*) relance l'analyse du dossier.
 
+### Copier, favoris, tags et EXIF (dans les deux modes)
+
+Un **clic droit** sur une vignette, ou les boutons de la visionneuse, donnent accès aux actions
+suivantes. Les raccourcis s'appliquent à la photo affichée dans la visionneuse, ou à la
+vignette survolée par le pointeur dans la fenêtre principale.
+
+| Action | Raccourci | Effet |
+|--------|-----------|-------|
+| Copier l'image | Ctrl+C | place l'image dans le presse-papiers ; elle se colle (Ctrl+V) dans un traitement de texte, un logiciel de retouche, une messagerie… |
+| Copier le chemin du fichier | Ctrl+Maj+C | copie le chemin d'accès du fichier, sous forme de texte |
+| Copier vers un dossier… | Ctrl+S | copie le fichier de la photo dans le dossier choisi |
+| Ajouter aux favoris / retirer | F | la photo apparaît dans « ♥ Mes favoris » ; un cœur s'affiche sur sa vignette |
+| Tags… | T | cocher des tags existants ou en créer (séparés par des virgules) |
+| Informations EXIF… | I | appareil, objectif, date de prise de vue, temps de pose, ouverture, ISO, focale, flash, orientation, coordonnées GPS… puis toutes les balises par groupe |
+
+- **Copier un album, un événement ou un dossier** : clic droit sur l'élément dans le panneau
+  gauche › *Copier « … » vers un dossier…*, ou *Fichier › Copier l'élément sélectionné vers un
+  dossier…* (Ctrl+Maj+S). Fonctionne aussi pour une année d'événements, *Toutes les photos*,
+  les résultats d'une recherche, *Mes favoris* et un tag.
+  - Un sous-dossier portant le nom de l'album est créé (option décochable).
+  - Un **dossier iPhoto** est copié avec sa structure : un sous-dossier par album ou sous-dossier.
+  - Une **année d'événements** donne un sous-dossier par événement.
+  - En mode « Explorer un dossier », un dossier est copié avec ses sous-dossiers (seules les
+    images affichées par iphotor sont copiées).
+- **Fichier copié** (bibliothèques) : la *version affichée* (retouchée si elle existe) ou le
+  *fichier original* (tel que sorti de l'appareil, RAW compris).
+- **Sécurité des copies** : un fichier existant n'est jamais remplacé (« IMG_0001 (2).jpg »),
+  la date de modification d'origine est conservée, et les noms incompatibles avec les clés
+  USB (FAT, exFAT) sont corrigés. Une copie vers une bibliothèque ou vers le dossier consulté
+  est refusée. L'espace libre est vérifié avant de commencer. La copie se fait en arrière-plan,
+  avec une barre de progression et un bouton *Annuler*. Les photos introuvables (disque
+  débranché) sont signalées à la fin.
+- **Mes favoris et Tags** : deux entrées du panneau gauche, sous *Toutes les photos* (ou sous le
+  dossier ouvert). Un clic affiche les photos correspondantes ; un clic droit sur un tag permet
+  de le retirer de toutes les photos. Les favoris et les tags sont propres à chaque
+  bibliothèque ; ceux des dossiers explorés sont liés au chemin des fichiers. Ils sont
+  enregistrés par iphotor (voir § 7) : **la bibliothèque n'est pas modifiée**, et les favoris ou
+  mots-clés définis autrefois dans iPhoto ne sont pas touchés.
+- **EXIF** : lus dans le fichier original. Le bouton *Copier le texte* copie toutes les
+  informations ; *Voir sur une carte* ouvre la position GPS dans OpenStreetMap (navigateur).
+  Pour les fichiers HEIC, installez `exiftool` (paquet `libimage-exiftool-perl`).
+
 ## 6. Règle de lecture seule
 
 - Tous les fichiers de la bibliothèque sont ouverts en mode `rb` uniquement.
@@ -167,8 +213,11 @@ passe de l'un à l'autre.
 - Les dossiers explorés sont traités de la même façon : seules la liste des fichiers
   (`os.scandir`) et leur lecture sont utilisées, et un garde-fou (`FolderLibrary.assert_outside`)
   refuse toute écriture dans le dossier consulté. Rien n'y est jamais déplacé ni supprimé.
-- Le bouton « Ouvrir avec l'application par défaut » de la visionneuse passe le fichier à
-  `xdg-open` (utile pour les vidéos). Le fichier est alors ouvert par une autre application.
+- Le bouton « Ouvrir ↗ » de la visionneuse passe le fichier à `xdg-open` (utile pour les
+  vidéos). Le fichier est alors ouvert par une autre application.
+- Les copies lisent les fichiers sources et écrivent uniquement dans le dossier de destination
+  choisi. Celui-ci ne peut pas se trouver dans une bibliothèque ou dans le dossier consulté.
+- Les favoris et les tags ne sont pas écrits dans les photos ni dans la bibliothèque.
 
 ## 7. Organisation du cache
 
@@ -198,7 +247,11 @@ sont pas enregistrées, pour ne rien écrire dans le dossier consulté.
 
 Les préférences (dernière bibliothèque, liste des récentes, dernier dossier exploré, tri et
 option des sous-dossiers) sont dans
-`~/.config/iphotor/config.json`. Le cache unique de la version 1.0.0 est déplacé
+`~/.config/iphotor/config.json`, avec le dernier dossier de destination des copies.
+
+Les **favoris et tags** sont dans `~/.local/share/iphotor/annotations.sqlite3` (ou
+`$XDG_DATA_HOME/iphotor/`) : ils ne font pas partie du cache et ne sont pas effacés quand on le
+vide. Pour les sauvegarder, copiez ce fichier. Le cache unique de la version 1.0.0 est déplacé
 automatiquement dans le dossier de sa bibliothèque au premier lancement.
 
 - **index.sqlite3** contient les tables :
@@ -264,6 +317,11 @@ automatiquement dans le dossier de sa bibliothèque au premier lancement.
 | Dossier exploré inexistant ou sans droit de lecture | message « Dossier inaccessible » |
 | Sous-dossier inaccessible pendant l'analyse | ignoré ; listé sous « ⚠ Dossiers inaccessibles » dans le panneau gauche, avec la raison |
 | Dossier exploré sans image         | « Aucune image (JPG, PNG, GIF, BMP, TIFF) dans ce dossier. » |
+| Copie vers une bibliothèque ou le dossier consulté | refusée, avec un message           |
+| Destination sans droit d'écriture ou trop petite | refusée avant le début de la copie   |
+| Fichier à copier introuvable       | ignoré ; listé dans le bilan de fin de copie               |
+| Presse-papiers indisponible        | message proposant d'installer `wl-clipboard` ou `xclip`, ou de copier le chemin |
+| EXIF illisible (HEIC sans exiftool, format inconnu) | message dans la fenêtre « Informations » |
 
 ## 10. Vérification de cohérence
 

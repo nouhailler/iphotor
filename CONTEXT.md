@@ -11,6 +11,8 @@ depuis Linux. iphotor permet de les parcourir sous Debian en conservant leur org
 (albums, dossiers, événements, légendes, commentaires, notes), **sans jamais les modifier**.
 Depuis la version 1.3, il sert aussi de visionneuse pour n'importe quel dossier d'images
 (mode « Explorer un dossier »), avec les mêmes garanties de lecture seule.
+La version 1.4 ajoute la copie (presse-papiers, dossier de destination), les favoris, les
+tags et l'affichage des informations EXIF.
 
 ## 2. Contraintes non négociables
 
@@ -23,12 +25,17 @@ Depuis la version 1.3, il sert aussi de visionneuse pour n'importe quel dossier 
    - Une base SQLite de la bibliothèque n'est jamais ouverte sur place. Elle est copiée dans
      le cache (voir § 4), ou ouverte en `mode=ro&immutable=1`.
    La même règle vaut pour les dossiers explorés (`FolderLibrary.assert_outside()`).
+   Les copies (`CopyTask`) lisent les sources et refusent toute destination située dans une
+   bibliothèque ou un dossier consulté ; elles ne remplacent jamais un fichier existant.
+   Les favoris et les tags ne sont jamais écrits dans les photos ni dans la bibliothèque.
 2. **Caches hors bibliothèque :** `~/.cache/photoexplorer_iphoto/bibliotheques/<nom>-<empreinte>/`,
    un dossier par bibliothèque, et `…/dossiers/thumbs/` pour les dossiers explorés. Si le
    dossier exploré contient le cache, les vignettes ne sont pas enregistrées. Les préférences
-   sont dans `~/.config/iphotor/config.json`.
+   sont dans `~/.config/iphotor/config.json`. Les favoris et les tags, qui sont des données de
+   l'utilisateur et non un cache, sont dans `~/.local/share/iphotor/annotations.sqlite3`.
 3. **Pile technique :** Python 3, Tkinter/ttk, Pillow, plistlib, sqlite3. GdkPixbuf est
-   facultatif, pour le HEIC. Aucun serveur et aucune connexion réseau.
+   facultatif, pour le HEIC et le presse-papiers. Aucun serveur et aucune connexion réseau
+   (seul le bouton « Voir sur une carte » ouvre OpenStreetMap dans le navigateur, à la demande).
 4. **Un seul fichier** (`iphotor.py`) pour simplifier l'installation, mais organisé en classes.
 5. **Interface et messages en français.**
 6. **Robustesse :** une photo manquante ou illisible ne doit jamais arrêter l'application.
@@ -162,6 +169,12 @@ iphotor.py
 ├── FolderBrowser    mode dossier : filtre (sous-dossier, nom), tri ; même interface que PhotoManager
 ├── FolderLibrary    mode dossier : équivalent de LibraryManager (fichier affichable, garde-fou d'écriture)
 ├── FolderThumbCache mode dossier : vignettes dans …/dossiers/thumbs/, clé = chemin + taille + date
+├── Annotations      favoris et tags (annotations.sqlite3) ; clé = (portée, GUID) pour une bibliothèque,
+│                    (« fichiers », chemin absolu) pour un dossier exploré : photo_scope_key()
+├── read_exif()      EXIF via Pillow (IFD0, Exif, GPS), repli sur exiftool (HEIC) ; résumé en français
+├── copy_png_to_clipboard()  image → presse-papiers : wl-copy, xclip, ou processus GTK auxiliaire
+├── CopyTask         copie dans un thread : résolution des fichiers, espace libre, noms uniques, annulation
+├── TagDialog, ExifDialog, CopyDialog, CopyProgress   fenêtres des nouvelles actions
 ├── MainWindow       arborescence + grille sur un Canvas + recherche + pagination + changement de bibliothèque
 │                    + barre des modes (set_mode sauvegarde et restaure l'état de chaque mode)
 └── verify()         contrôle de cohérence en ligne de commande (--verifier)
@@ -187,6 +200,13 @@ iphotor.py
   `Photo` avec `source = "folder"`. Changer de mode échange ces objets (`_MODE_ATTRS`), sans
   rien recharger. Les noms de fichiers qui ne sont pas de l'UTF-8 valide passent par
   `safe_text()` pour l'affichage, et le vrai chemin est conservé pour la lecture.
+- **Favoris et tags :** une vue `View("keys", keys=…)` sélectionne les photos par GUID
+  (`json_each`) ; en mode dossier, `FolderBrowser.only` filtre par chemin. Les entrées
+  « Mes favoris » et « Tags » de l'arborescence sont recréées après chaque modification
+  (`_refresh_annotations_tree`), sans recharger la vue courante sauf si c'est l'une d'elles.
+- **Presse-papiers :** Tk ne sait copier que du texte. L'image est convertie en PNG, puis
+  confiée à `wl-copy` ou `xclip`, sinon à un petit processus Python/GTK (X11, donc aussi
+  XWayland) qui garde l'image jusqu'à ce qu'une autre application prenne le presse-papiers.
 - **Version du schéma :** `INDEX_SCHEMA_VERSION`. À incrémenter à chaque modification du
   schéma, ce qui force la reconstruction de l'index.
 
@@ -212,7 +232,8 @@ iphotor.py
 - Prendre en charge les bibliothèques Photos 5 et suivantes (`Photos.sqlite`).
 - Lire les vidéos (lecteur externe ou intégré).
 - Décoder directement les RAW (par exemple avec `rawpy`) quand il n'y a pas d'aperçu intégré.
-- Exporter une sélection (copie vers un dossier choisi, **jamais** dans la bibliothèque).
+- Sélection multiple dans la grille (favoris, tags et copie de plusieurs photos à la fois).
+- Importer les mots-clés et les favoris d'iPhoto / Photos comme tags iphotor (lecture seule).
 - Prévoir un mode de recherche avancé : par date, par note, recherche combinée.
 - Mode dossier : HEIC et RAW (déjà décodés pour les bibliothèques), dossiers récents,
   surveillance des changements du dossier.

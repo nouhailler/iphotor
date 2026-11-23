@@ -4,6 +4,41 @@ Toutes les évolutions notables d'iphotor sont consignées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions selon
 [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [1.4.0] — 2026-11-23
+
+### Ajouté
+
+- **Copier une photo dans le presse-papiers** (Ctrl+C) : l'image se colle dans une autre
+  application. Utilise `wl-copy` ou `xclip` s'ils sont installés, sinon GTK.
+  *Copier le chemin du fichier* (Ctrl+Maj+C) copie le chemin sous forme de texte.
+- **Copier vers un dossier** : une photo (Ctrl+S), un album, un événement, une année
+  d'événements, un dossier iPhoto (avec sa structure d'albums), un dossier exploré (avec ses
+  sous-dossiers), les favoris, un tag ou les résultats d'une recherche. Clic droit dans le
+  panneau gauche, ou *Fichier › Copier l'élément sélectionné vers un dossier…* (Ctrl+Maj+S).
+  - Choix de la version affichée (retouchée) ou du fichier original.
+  - Aucun fichier existant n'est remplacé ; la date de modification est conservée ; noms
+    compatibles avec les clés USB.
+  - Destination refusée si elle se trouve dans une bibliothèque ou dans le dossier consulté.
+  - Copie en arrière-plan avec progression, annulation et bilan (fichiers introuvables).
+- **Favoris** (touche F) : entrée « ♥ Mes favoris » dans le panneau gauche, cœur sur les
+  vignettes.
+- **Tags** (touche T) : tags libres sur chaque photo, entrée « 🏷 Tags » dans le panneau
+  gauche, retrait d'un tag de toutes les photos.
+- Favoris et tags enregistrés dans `~/.local/share/iphotor/annotations.sqlite3`, jamais dans
+  la bibliothèque ni dans les fichiers.
+- **Informations EXIF** (touche I) : résumé en français (appareil, objectif, date, exposition,
+  ouverture, ISO, focale, flash, GPS…) et toutes les balises par groupe, copie du texte,
+  position GPS sur OpenStreetMap. Fichiers HEIC lus avec `exiftool` s'il est installé.
+- Menu contextuel (clic droit) sur les vignettes et dans la visionneuse ; nouveaux boutons dans
+  la visionneuse (Favori, Tags, EXIF, Copier, Copier vers…).
+
+### Modifié
+
+- Le bouton « Ouvrir avec l'application par défaut » de la visionneuse devient « Ouvrir ↗ ».
+- La fenêtre des raccourcis clavier liste les nouvelles actions.
+- Paquet .deb : recommande `gir1.2-gtk-3.0` et suggère `wl-clipboard`, `xclip` et
+  `libimage-exiftool-perl`.
+
 ## [1.3.0] — 2026-11-23
 
 ### Ajouté
@@ -130,6 +165,7 @@ Première version fonctionnelle.
 - Le nom d'événement est stocké dans la table `photos`, pour garder des requêtes paginées
   sous 0,1 s.
 
+[1.4.0]: ../../releases/tag/v1.4.0
 [1.3.0]: ../../releases/tag/v1.3.0
 [1.2.0]: ../../releases/tag/v1.2.0
 [1.1.0]: ../../releases/tag/v1.1.0

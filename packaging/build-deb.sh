@@ -40,7 +40,8 @@ Section: graphics
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-tk, python3-pil, python3-pil.imagetk
-Recommends: xdg-utils, python3-gi, gir1.2-gdkpixbuf-2.0, heif-gdk-pixbuf
+Recommends: xdg-utils, python3-gi, gir1.2-gdkpixbuf-2.0, gir1.2-gtk-3.0, heif-gdk-pixbuf
+Suggests: wl-clipboard, xclip, libimage-exiftool-perl
 Installed-Size: $SIZE
 Maintainer: Mainteneurs d'iphotor <iphotor@users.noreply.github.com>
 Description: explorateur en lecture seule de bibliothèques iPhoto et Photos
@@ -52,8 +53,14 @@ Description: explorateur en lecture seule de bibliothèques iPhoto et Photos
  Le mode « Explorer un dossier » affiche aussi les images (JPG, PNG, GIF,
  BMP, TIFF) de n'importe quel dossier, sous-dossiers compris.
  .
+ Les photos, albums, événements et dossiers peuvent être copiés vers un
+ dossier de destination, une photo peut être copiée dans le presse-papiers,
+ marquée comme favorite ou classée par tags, et ses informations EXIF
+ affichées.
+ .
  La bibliothèque n'est jamais modifiée : l'index et les miniatures sont
- stockés dans ~/.cache/photoexplorer_iphoto/.
+ stockés dans ~/.cache/photoexplorer_iphoto/, les favoris et les tags dans
+ ~/.local/share/iphotor/.
 CTRL
 cat > "$D/DEBIAN/postinst" <<'POST'
 #!/bin/sh
