@@ -2,9 +2,10 @@
 
 Application de bureau Python/Tkinter qui permet de parcourir sous Debian 13, **en lecture
 seule**, une ancienne bibliothèque iPhoto (iPhoto 9.x) ou une bibliothèque
-de l'app Photos 1 à 4 (macOS 10.10 à 10.14).
+de l'app Photos 1 à 4 (macOS 10.10 à 10.14), ainsi que **n'importe quel dossier d'images**
+de l'ordinateur ou d'un disque externe.
 
-Version actuelle : **1.2.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
+Version actuelle : **1.3.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
 [CONTEXT.md](CONTEXT.md) pour le contexte, les contraintes et la structure des bibliothèques
 (AlbumData.xml d'iPhoto, base SQLite de Photos).
 
@@ -19,6 +20,7 @@ Version actuelle : **1.2.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 | HEIC (iPhone)                  | oui, si les paquets HEIC facultatifs sont installés          |
 | RAW (CR2, NEF, ARW, DNG, PEF, SRW) | oui : JPEG généré par iPhoto/Photos, sinon aperçu intégré au fichier |
 | Vidéos (MOV, MP4, AVI, MPG…)   | vignette seulement ; lecture avec l'application par défaut   |
+| Dossier quelconque             | oui (mode « Explorer un dossier ») : JPG, JPEG, PNG, GIF, BMP, TIFF |
 
 ## 2. Dépendances
 
@@ -36,11 +38,11 @@ Version actuelle : **1.2.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 
 ### Option A : paquet .deb (recommandé)
 
-Téléchargez `iphotor_1.2.0_all.deb` depuis la
+Téléchargez `iphotor_1.3.0_all.deb` depuis la
 [page des releases](../../releases), puis :
 
 ```bash
-sudo apt install ./iphotor_1.2.0_all.deb
+sudo apt install ./iphotor_1.3.0_all.deb
 ```
 
 `apt` installe automatiquement les dépendances. L'application apparaît dans le menu
@@ -94,6 +96,12 @@ n'est trouvée au démarrage, la fenêtre « Ouvrir une bibliothèque » s'affic
 
 ## 5. Utilisation
 
+La barre du haut propose deux modes : **Bibliothèque iPhoto** et **Explorer un dossier**.
+Chaque mode garde son état (sélection, page, recherche, position dans la grille) quand on
+passe de l'un à l'autre.
+
+### Mode « Bibliothèque iPhoto »
+
 - **Plusieurs bibliothèques** : *Fichier › Ouvrir une bibliothèque…* (Ctrl+O) affiche les
   bibliothèques récentes et celles détectées sur les disques montés (`/media/<utilisateur>`,
   `/mnt`, `~/Images`…), avec leur état (indexée ou non). Le bouton *Parcourir…* permet de
@@ -125,6 +133,29 @@ n'est trouvée au démarrage, la fenêtre « Ouvrir une bibliothèque » s'affic
   qui apparaissent sous le nœud « Résultats » de l'arborescence. Portée : toute la
   photothèque ou l'album sélectionné.
 
+### Mode « Explorer un dossier »
+
+- **Ouvrir un dossier** : bouton *Ouvrir un dossier…* de la barre du haut, *Fichier › Ouvrir
+  un dossier…* ou Ctrl+Maj+O. Le sélecteur de dossiers de Tk s'ouvre ; le dossier choisi est
+  analysé en arrière-plan, puis ses images s'affichent en grille. Le dernier dossier ouvert
+  est rouvert au retour dans ce mode.
+- **Formats** : JPG, JPEG, PNG, GIF, BMP et TIFF. Les fichiers et dossiers cachés (dont les
+  fichiers `._*` laissés par macOS sur les disques externes) sont ignorés, ainsi que les liens
+  symboliques vers des dossiers.
+- **Inclure les sous-dossiers** : case à cocher de la barre du haut. Le panneau gauche affiche
+  alors l'arborescence des sous-dossiers qui contiennent des images ; un clic sur un
+  sous-dossier n'affiche que ses images (et celles de ses propres sous-dossiers).
+- **Tri** : par nom (ordre naturel : `IMG_2` avant `IMG_10`), par date de modification ou par
+  taille, dans les deux sens. Le tri choisi est mémorisé.
+- **Recherche** (Ctrl+F, puis Entrée) : sur le nom de fichier, insensible à la casse et aux
+  accents, dans le dossier ou le sous-dossier sélectionné.
+- **Grille** : 100 images par page, avec le nom du fichier, la date de modification et la
+  taille sous chaque miniature. Le survol affiche le chemin complet dans la barre d'état.
+- **Visionneuse** (clic sur une miniature) : la même que pour les bibliothèques, avec
+  navigation précédente / suivante sur toutes les images de la vue. Elle affiche le dossier,
+  la date de modification, la taille, les **dimensions** et le **chemin d'accès** de l'image.
+- **F5** (ou *Fichier › Recharger*) relance l'analyse du dossier.
+
 ## 6. Règle de lecture seule
 
 - Tous les fichiers de la bibliothèque sont ouverts en mode `rb` uniquement.
@@ -133,6 +164,9 @@ n'est trouvée au démarrage, la fenêtre « Ouvrir une bibliothèque » s'affic
 - Les bases SQLite internes d'iPhoto (`Database/`) ne sont pas utilisées.
 - La base d'une bibliothèque Photos n'est jamais ouverte sur place : elle est copiée, avec son
   journal WAL, dans le dossier de cache, lue depuis cette copie, puis la copie est supprimée.
+- Les dossiers explorés sont traités de la même façon : seules la liste des fichiers
+  (`os.scandir`) et leur lecture sont utilisées, et un garde-fou (`FolderLibrary.assert_outside`)
+  refuse toute écriture dans le dossier consulté. Rien n'y est jamais déplacé ni supprimé.
 - Le bouton « Ouvrir avec l'application par défaut » de la visionneuse passe le fichier à
   `xdg-open` (utile pour les vidéos). Le fichier est alors ouvert par une autre application.
 
@@ -151,9 +185,19 @@ avec **un dossier par bibliothèque** :
     │       └── <id>_<horodatage>.jpg
     └── Autre_bibliotheque-9876543210/
         └── …
+└── dossiers/
+    └── thumbs/                         vignettes des dossiers explorés (mode « Explorer un dossier »)
+        ├── 00/ … ff/
+        └── <empreinte du chemin, de la taille et de la date>.jpg
 ```
 
-Les préférences (dernière bibliothèque, liste des récentes) sont dans
+Les vignettes des dossiers explorés sont repérées par le chemin, la taille et la date de
+modification du fichier : une image modifiée obtient une nouvelle vignette. Si le dossier
+exploré contient lui-même le cache (par exemple tout le dossier personnel), les vignettes ne
+sont pas enregistrées, pour ne rien écrire dans le dossier consulté.
+
+Les préférences (dernière bibliothèque, liste des récentes, dernier dossier exploré, tri et
+option des sous-dossiers) sont dans
 `~/.config/iphotor/config.json`. Le cache unique de la version 1.0.0 est déplacé
 automatiquement dans le dossier de sa bibliothèque au premier lancement.
 
@@ -217,6 +261,9 @@ automatiquement dans le dossier de sa bibliothèque au premier lancement.
 | Photo HEIC sans paquets HEIC       | miniature de la bibliothèque si elle existe, sinon vignette « Image introuvable » |
 | RAW sans JPEG ni aperçu intégré    | « Format RAW sans aperçu JPEG exploitable »                 |
 | Dossier illisible sur le disque (erreur d'entrée/sortie) | repli sur un autre fichier de la photo, sans interrompre l'application |
+| Dossier exploré inexistant ou sans droit de lecture | message « Dossier inaccessible » |
+| Sous-dossier inaccessible pendant l'analyse | ignoré ; listé sous « ⚠ Dossiers inaccessibles » dans le panneau gauche, avec la raison |
+| Dossier exploré sans image         | « Aucune image (JPG, PNG, GIF, BMP, TIFF) dans ce dossier. » |
 
 ## 10. Vérification de cohérence
 

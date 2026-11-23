@@ -4,6 +4,36 @@ Toutes les évolutions notables d'iphotor sont consignées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions selon
 [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [1.3.0] — 2026-11-23
+
+### Ajouté
+
+- **Mode « Explorer un dossier »** : ouverture de n'importe quel dossier de l'ordinateur ou
+  d'un disque externe (bouton *Ouvrir un dossier…*, *Fichier › Ouvrir un dossier…*,
+  Ctrl+Maj+O), avec le sélecteur de dossiers de Tk.
+  - Images JPG, JPEG, PNG, GIF, BMP et TIFF, en grille paginée (100 par page), avec le nom
+    du fichier, la date de modification et la taille sous chaque miniature.
+  - Option *Inclure les sous-dossiers*, avec l'arborescence des sous-dossiers dans le panneau
+    gauche.
+  - Tri par nom (ordre naturel), date de modification ou taille, dans les deux sens.
+  - Recherche par nom de fichier, insensible à la casse et aux accents.
+  - Visionneuse partagée avec les bibliothèques : navigation précédente / suivante,
+    dimensions et chemin d'accès de l'image.
+  - Analyse en arrière-plan, annulée si un autre dossier est choisi. Les dossiers
+    inaccessibles et les fichiers illisibles sont signalés sans interrompre l'application.
+  - Miniatures en cache dans `~/.cache/photoexplorer_iphoto/dossiers/`, jamais dans le
+    dossier consulté.
+- Barre des modes **Bibliothèque iPhoto** / **Explorer un dossier** : chaque mode conserve son
+  état de navigation (sélection, page, recherche, position dans la grille).
+- La visionneuse affiche aussi les dimensions des photos des bibliothèques.
+- Raccourci F5 : recharger la bibliothèque ou le dossier.
+
+### Modifié
+
+- *Fichier › Recharger la bibliothèque* devient *Fichier › Recharger* (selon le mode).
+- Un long chemin dans le sous-titre ne réduit plus le champ de recherche.
+- Message plus clair pour une image dont le format n'est pas reconnu.
+
 ## [1.2.0] — 2026-11-23
 
 ### Ajouté
@@ -100,6 +130,7 @@ Première version fonctionnelle.
 - Le nom d'événement est stocké dans la table `photos`, pour garder des requêtes paginées
   sous 0,1 s.
 
+[1.3.0]: ../../releases/tag/v1.3.0
 [1.2.0]: ../../releases/tag/v1.2.0
 [1.1.0]: ../../releases/tag/v1.1.0
 [1.0.0]: ../../releases/tag/v1.0.0

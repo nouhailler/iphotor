@@ -9,6 +9,8 @@ iPhoto et les premières versions de l'app Photos n'existent que sous macOS. Leu
 bibliothèques, souvent conservées sur un disque externe, deviennent difficiles à consulter
 depuis Linux. iphotor permet de les parcourir sous Debian en conservant leur organisation
 (albums, dossiers, événements, légendes, commentaires, notes), **sans jamais les modifier**.
+Depuis la version 1.3, il sert aussi de visionneuse pour n'importe quel dossier d'images
+(mode « Explorer un dossier »), avec les mêmes garanties de lecture seule.
 
 ## 2. Contraintes non négociables
 
@@ -20,8 +22,11 @@ depuis Linux. iphotor permet de les parcourir sous Debian en conservant leur org
      dans la bibliothèque.
    - Une base SQLite de la bibliothèque n'est jamais ouverte sur place. Elle est copiée dans
      le cache (voir § 4), ou ouverte en `mode=ro&immutable=1`.
+   La même règle vaut pour les dossiers explorés (`FolderLibrary.assert_outside()`).
 2. **Caches hors bibliothèque :** `~/.cache/photoexplorer_iphoto/bibliotheques/<nom>-<empreinte>/`,
-   un dossier par bibliothèque. Les préférences sont dans `~/.config/iphotor/config.json`.
+   un dossier par bibliothèque, et `…/dossiers/thumbs/` pour les dossiers explorés. Si le
+   dossier exploré contient le cache, les vignettes ne sont pas enregistrées. Les préférences
+   sont dans `~/.config/iphotor/config.json`.
 3. **Pile technique :** Python 3, Tkinter/ttk, Pillow, plistlib, sqlite3. GdkPixbuf est
    facultatif, pour le HEIC. Aucun serveur et aucune connexion réseau.
 4. **Un seul fichier** (`iphotor.py`) pour simplifier l'installation, mais organisé en classes.
@@ -153,7 +158,12 @@ iphotor.py
 ├── load_pil_image() JPEG/PNG/… (Pillow), HEIC (GdkPixbuf), RAW (aperçu intégré)
 ├── PhotoViewer      fenêtre de visualisation (chargement dans un thread, redimensionnement)
 ├── LibraryDialog    fenêtre « Ouvrir une bibliothèque » (récentes, détectées, parcourir)
+├── FolderScanner    mode dossier : recherche des images (os.scandir, thread, annulable, erreurs tolérées)
+├── FolderBrowser    mode dossier : filtre (sous-dossier, nom), tri ; même interface que PhotoManager
+├── FolderLibrary    mode dossier : équivalent de LibraryManager (fichier affichable, garde-fou d'écriture)
+├── FolderThumbCache mode dossier : vignettes dans …/dossiers/thumbs/, clé = chemin + taille + date
 ├── MainWindow       arborescence + grille sur un Canvas + recherche + pagination + changement de bibliothèque
+│                    + barre des modes (set_mode sauvegarde et restaure l'état de chaque mode)
 └── verify()         contrôle de cohérence en ligne de commande (--verifier)
 ```
 
@@ -171,6 +181,12 @@ iphotor.py
   l'affichage. Pour Photos, ce sont des chemins relatifs à la racine de la bibliothèque.
 - **Mémoire :** au plus 100 vignettes et une seule image en grand. Le décodage JPEG est
   réduit avec `Image.draft()`.
+- **Mode dossier :** il réutilise la grille, `ThumbnailLoader` et `PhotoViewer` par
+  *duck typing* : `FolderBrowser` remplace `PhotoManager`, `FolderLibrary` remplace
+  `LibraryManager` et `FolderThumbCache` remplace `CacheManager`. Les images sont des objets
+  `Photo` avec `source = "folder"`. Changer de mode échange ces objets (`_MODE_ATTRS`), sans
+  rien recharger. Les noms de fichiers qui ne sont pas de l'UTF-8 valide passent par
+  `safe_text()` pour l'affichage, et le vrai chemin est conservé pour la lecture.
 - **Version du schéma :** `INDEX_SCHEMA_VERSION`. À incrémenter à chaque modification du
   schéma, ce qui force la reconstruction de l'index.
 
@@ -198,4 +214,6 @@ iphotor.py
 - Décoder directement les RAW (par exemple avec `rawpy`) quand il n'y a pas d'aperçu intégré.
 - Exporter une sélection (copie vers un dossier choisi, **jamais** dans la bibliothèque).
 - Prévoir un mode de recherche avancé : par date, par note, recherche combinée.
+- Mode dossier : HEIC et RAW (déjà décodés pour les bibliothèques), dossiers récents,
+  surveillance des changements du dossier.
 - Tester le comportement avec le disque débranché, qui n'a pas encore été vérifié en conditions réelles.

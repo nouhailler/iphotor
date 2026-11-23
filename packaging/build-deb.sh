@@ -49,6 +49,9 @@ Description: explorateur en lecture seule de bibliothèques iPhoto et Photos
  événements, légendes, commentaires et notes. Les photos HEIC et l'aperçu
  intégré des fichiers RAW (CR2, NEF, DNG…) sont affichés.
  .
+ Le mode « Explorer un dossier » affiche aussi les images (JPG, PNG, GIF,
+ BMP, TIFF) de n'importe quel dossier, sous-dossiers compris.
+ .
  La bibliothèque n'est jamais modifiée : l'index et les miniatures sont
  stockés dans ~/.cache/photoexplorer_iphoto/.
 CTRL

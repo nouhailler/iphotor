@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-iphotor — Explorateur en lecture seule d'une ancienne bibliothèque iPhoto ou Photos (1 à 4).
+iphotor — Explorateur en lecture seule d'une ancienne bibliothèque iPhoto ou Photos (1 à 4),
+et de n'importe quel dossier d'images (mode « Explorer un dossier »).
 
-Version 1.2
+Version 1.3
 
-Principe fondamental : la bibliothèque iPhoto n'est JAMAIS modifiée.
+Principe fondamental : la bibliothèque iPhoto et les dossiers consultés ne sont JAMAIS modifiés.
   * Tous les fichiers de la bibliothèque sont ouverts en lecture seule ("rb").
   * Aucun fichier n'est créé, déplacé, renommé ou supprimé dans la bibliothèque.
   * L'index et le cache des miniatures sont stockés dans
     ~/.cache/photoexplorer_iphoto/ (ou $XDG_CACHE_HOME/photoexplorer_iphoto/).
+  * Les miniatures des dossiers explorés vont dans ~/.cache/photoexplorer_iphoto/dossiers/.
 
 Utilisation :
     ./iphotor.py                       interface graphique
@@ -68,7 +70,7 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 APP_NAME = "iphotor"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # Emplacement par défaut (nom standard sous macOS) ; sinon, choisir via « Ouvrir une bibliothèque ».
 DEFAULT_LIBRARY = os.path.expanduser("~/Pictures/iPhoto Library")
@@ -108,6 +110,10 @@ KIND_FOLDER = "folder"
 KIND_EVENT = "event"
 KIND_SPECIAL = "special"
 KIND_ALL = "all"
+
+# Modes de l'interface
+MODE_LIBRARY = "library"   # bibliothèque iPhoto / Photos
+MODE_FOLDER = "folder"     # dossier indépendant
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +218,9 @@ class Photo:
     mod_date: Optional[float]
     filename: str
     event_name: str = ""
+    size: int = 0          # taille du fichier (mode « Explorer un dossier »)
+    folder: str = ""       # sous-dossier relatif au dossier ouvert ("" = le dossier lui-même)
+    source: str = ""       # "folder" pour une image d'un dossier indépendant
 
     @property
     def is_video(self) -> bool:
@@ -1118,6 +1127,9 @@ class Settings:
         self.path = path
         self.last_library: str = ""
         self.recent: list[str] = []
+        self.last_folder: str = ""
+        self.folder_recursive: bool = False
+        self.folder_sort: str = ""
         self.load()
 
     def load(self) -> None:
@@ -1129,13 +1141,18 @@ class Settings:
         if isinstance(data, dict):
             self.last_library = _as_str(data.get("last_library"))
             self.recent = [_as_str(p) for p in data.get("recent", []) if p][:MAX_RECENT]
+            self.last_folder = _as_str(data.get("last_folder"))
+            self.folder_recursive = bool(data.get("folder_recursive", False))
+            self.folder_sort = _as_str(data.get("folder_sort"))
 
     def save(self) -> None:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"last_library": self.last_library, "recent": self.recent},
+                json.dump({"last_library": self.last_library, "recent": self.recent,
+                           "last_folder": self.last_folder, "folder_recursive": self.folder_recursive,
+                           "folder_sort": self.folder_sort},
                           fh, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
         except OSError as exc:
@@ -1684,6 +1701,267 @@ class ThumbnailLoader:
 
 
 # ---------------------------------------------------------------------------
+# Exploration de dossiers indépendants (lecture seule)
+# ---------------------------------------------------------------------------
+
+FOLDER_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff"}
+FOLDER_CACHE_DIR = os.path.join(CACHE_DIR, "dossiers")
+
+# (libellé, clé, ordre décroissant)
+FOLDER_SORTS = [
+    ("Nom (A → Z)", "name", False),
+    ("Nom (Z → A)", "name", True),
+    ("Date de modification (récentes)", "mtime", True),
+    ("Date de modification (anciennes)", "mtime", False),
+    ("Taille (grandes d'abord)", "size", True),
+    ("Taille (petites d'abord)", "size", False),
+]
+
+
+def safe_text(value: str) -> str:
+    """Nom affichable dans Tk, même si le nom de fichier n'est pas de l'UTF-8 valide."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def unix_to_interval(ts: float) -> Optional[float]:
+    """Date Unix -> « TimerInterval » Apple (heure locale), pour réutiliser format_date."""
+    try:
+        return (_dt.datetime.fromtimestamp(ts) - APPLE_EPOCH).total_seconds()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def format_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} o"
+    for unit in ("Ko", "Mo", "Go", "To"):
+        n /= 1024
+        if n < 1024 or unit == "To":
+            return f"{n:.1f} {unit}".replace(".", ",")
+    return ""
+
+
+def natural_key(text: str) -> list:
+    """Clé de tri « naturelle » : IMG_2 avant IMG_10, sans tenir compte de la casse ni des accents."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", normalize_text(text))]
+
+
+def image_size(path: str) -> Optional[tuple[int, int]]:
+    """Dimensions d'une image (lecture de l'en-tête uniquement), orientation EXIF comprise."""
+    if Image is None or file_ext(path) in RAW_TIFF_EXTS | HEIF_EXTS:
+        return None
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            try:
+                if im.getexif().get(0x0112) in (5, 6, 7, 8):
+                    w, h = h, w
+            except Exception:
+                pass
+            return w, h
+    except Exception:
+        return None
+
+
+class FolderScanner:
+    """Recherche les images d'un dossier (et éventuellement de ses sous-dossiers).
+
+    Lecture seule : seuls os.scandir() et stat() sont utilisés. Les dossiers
+    inaccessibles et les fichiers illisibles sont comptés, sans interrompre l'analyse.
+    Les éléments cachés (« .xxx », dont les fichiers « ._xxx » des disques macOS)
+    et les liens symboliques vers des dossiers sont ignorés.
+    """
+
+    def __init__(self, root: str, recursive: bool):
+        self.root = root
+        self.recursive = recursive
+        self.cancelled = threading.Event()
+        self.entries: list[tuple[str, str, str, float, int]] = []   # chemin, sous-dossier, nom, mtime, taille
+        self.errors: list[tuple[str, str]] = []                     # dossiers inaccessibles
+        self.unreadable = 0
+        self.dirs_seen = 0
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+
+    def run(self, progress: Callable[[int, int], None] = lambda d, n: None) -> None:
+        stack: list[tuple[str, str]] = [(self.root, "")]
+        last = time.monotonic()
+        while stack:
+            if self.cancelled.is_set():
+                return
+            directory, rel = stack.pop()
+            try:
+                with os.scandir(directory) as it:
+                    items = list(it)
+            except OSError as exc:
+                self.errors.append((rel or ".", exc.strerror or str(exc)))
+                continue
+            self.dirs_seen += 1
+            subdirs = []
+            for e in items:
+                name = e.name
+                if name.startswith("."):
+                    continue
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if self.recursive:
+                            subdirs.append((e.path, f"{rel}/{name}" if rel else name))
+                        continue
+                    if file_ext(name) not in FOLDER_IMAGE_EXTS or not e.is_file():
+                        continue
+                    st = e.stat()
+                except OSError:
+                    self.unreadable += 1
+                    continue
+                self.entries.append((e.path, rel, name, st.st_mtime, st.st_size))
+            subdirs.sort(key=lambda d: natural_key(d[1]), reverse=True)
+            stack.extend(subdirs)
+            now = time.monotonic()
+            if now - last > 0.25:
+                last = now
+                progress(self.dirs_seen, len(self.entries))
+
+
+class FolderBrowser:
+    """Contenu d'un dossier analysé : filtre, tri et pagination.
+
+    Expose la même interface que PhotoManager (count, page, ids, get), ce qui permet
+    de réutiliser la grille de vignettes et la visionneuse.
+    """
+
+    def __init__(self):
+        self.root = ""
+        self.recursive = False
+        self.photos: list[Photo] = []
+        self.errors: list[tuple[str, str]] = []
+        self.unreadable = 0
+        self.dir_counts: dict[str, int] = {}
+        self.sort_key = "name"
+        self.sort_desc = False
+        self.query = ""
+        self.subdir: Optional[str] = None
+        self.order: list[int] = []
+
+    def load(self, scanner: FolderScanner) -> None:
+        self.root = scanner.root
+        self.recursive = scanner.recursive
+        self.errors = scanner.errors
+        self.unreadable = scanner.unreadable
+        self.photos = []
+        self.dir_counts = {}
+        for i, (path, rel, name, mtime, size) in enumerate(scanner.entries):
+            interval = unix_to_interval(mtime)
+            self.photos.append(Photo(
+                id=i, guid="", caption="", comment="", rating=0, roll_id=None, media_type="Image",
+                image_path=path, original_path="", thumb_path="", date=interval, mod_date=mtime,
+                filename=safe_text(name), size=size, folder=safe_text(rel), source="folder"))
+            key = safe_text(rel)
+            self.dir_counts[key] = self.dir_counts.get(key, 0) + 1
+        self.query = ""
+        self.subdir = None
+        self.refresh()
+
+    def set_sort(self, key: str, desc: bool) -> None:
+        self.sort_key, self.sort_desc = key, desc
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Recalcule la liste affichée (sous-dossier, recherche, tri)."""
+        idx = range(len(self.photos))
+        sub = self.subdir
+        if sub:
+            prefix = sub + "/"
+            idx = [i for i in idx if self.photos[i].folder == sub or self.photos[i].folder.startswith(prefix)]
+        q = normalize_text(self.query.strip())
+        if q:
+            idx = [i for i in idx if q in normalize_text(self.photos[i].filename)]
+        ph = self.photos
+        if self.sort_key == "mtime":
+            key = lambda i: (ph[i].mod_date or 0)
+        elif self.sort_key == "size":
+            key = lambda i: ph[i].size
+        else:
+            key = lambda i: natural_key(f"{ph[i].folder}/{ph[i].filename}" if ph[i].folder else ph[i].filename)
+        self.order = sorted(idx, key=key, reverse=self.sort_desc)
+
+    # -- interface commune avec PhotoManager -----------------------------------
+    def count(self, _view=None) -> int:
+        return len(self.order)
+
+    def page(self, _view, offset: int, limit: int = PAGE_SIZE) -> list[Photo]:
+        return [self.photos[i] for i in self.order[offset:offset + limit]]
+
+    def ids(self, _view=None) -> list[int]:
+        return list(self.order)
+
+    def get(self, photo_id: int) -> Optional[Photo]:
+        return self.photos[photo_id] if 0 <= photo_id < len(self.photos) else None
+
+
+class FolderLibrary:
+    """Équivalent de LibraryManager pour un dossier indépendant (lecture seule)."""
+
+    def __init__(self, root: str):
+        self.root = os.path.abspath(root) if root else ""
+
+    existing = staticmethod(LibraryManager.existing)
+
+    def is_available(self) -> bool:
+        return bool(self.root) and os.path.isdir(self.root)
+
+    def unavailable_message(self) -> str:
+        return (f"Le dossier est inaccessible :\n{self.root}\n\n"
+                "Vérifiez que le disque qui le contient est bien branché et monté.")
+
+    def to_linux(self, path: str) -> str:
+        return path
+
+    def original_exists(self, photo: Photo) -> bool:
+        try:
+            return os.path.isfile(photo.image_path)
+        except (OSError, ValueError):
+            return False
+
+    def find_display_file(self, photo: Photo, for_thumbnail: bool) -> tuple[Optional[str], str]:
+        return (photo.image_path, "image") if self.original_exists(photo) else (None, "")
+
+    def assert_outside(self, path: str) -> None:
+        """Garde-fou : refuse toute écriture dans le dossier consulté."""
+        if self.root and is_inside(path, self.root):
+            raise PermissionError(f"Écriture refusée : {path} se trouve dans le dossier consulté.")
+
+
+class FolderThumbCache:
+    """Cache des miniatures des dossiers indépendants (~/.cache/photoexplorer_iphoto/dossiers/)."""
+
+    def __init__(self, library: FolderLibrary):
+        self.library = library
+        self.cache_dir = FOLDER_CACHE_DIR
+        self.thumb_dir = os.path.join(self.cache_dir, "thumbs")
+
+    def ensure_dirs(self) -> None:
+        self.library.assert_outside(self.thumb_dir)
+        os.makedirs(self.thumb_dir, exist_ok=True)
+
+    def usable(self) -> bool:
+        """Le cache est-il hors du dossier consulté ?"""
+        return not (self.library.root and is_inside(self.thumb_dir, self.library.root))
+
+    def thumb_cache_path(self, photo: Photo) -> str:
+        key = f"{photo.image_path}|{photo.size}|{photo.mod_date}"
+        digest = hashlib.sha1(key.encode("utf-8", "surrogateescape")).hexdigest()
+        return os.path.join(self.thumb_dir, digest[:2], digest + ".jpg")
+
+    clear_thumbnails = CacheManager.clear_thumbnails
+    thumbnails_size = CacheManager.thumbnails_size
+
+
+# ---------------------------------------------------------------------------
 # Interface graphique
 # ---------------------------------------------------------------------------
 
@@ -1723,6 +2001,7 @@ class PhotoViewer:
         self.request_no = 0
         self.results: "queue.Queue[tuple]" = queue.Queue()
         self._resize_job = None
+        self._details = ""
 
         # Barre de navigation
         bar = ttk.Frame(self.win, style="Panel.TFrame", padding=(8, 6))
@@ -1776,7 +2055,8 @@ class PhotoViewer:
         self.photo = self.app.photos.get(self.ids[index])
         self.btn_prev.state(["!disabled"] if index > 0 else ["disabled"])
         self.btn_next.state(["!disabled"] if index < len(self.ids) - 1 else ["disabled"])
-        self.pos_label.config(text=f"Photo {format_count(index + 1)} sur {format_count(len(self.ids))}")
+        noun = "Image" if self.photo is not None and self.photo.source == "folder" else "Photo"
+        self.pos_label.config(text=f"{noun} {format_count(index + 1)} sur {format_count(len(self.ids))}")
         self._update_info()
         self._load_current()
         self.app.sync_page_to_index(index)
@@ -1805,6 +2085,15 @@ class PhotoViewer:
             return
         self.win.title(f"{p.filename or p.label} — iphotor")
         self.info_title.config(text=p.caption or p.filename)
+        if p.source == "folder":
+            details = [f"Dossier : {p.folder or '.'}"]
+            if p.date is not None:
+                details.append(f"Modifiée le : {format_date(p.date)}")
+            details.append(f"Taille : {format_size(p.size)}")
+            self._details = "     ".join(details)
+            self.info_details.config(text=self._details)
+            self.info_comment.config(text=f"Chemin : {safe_text(p.image_path)}")
+            return
         details = [f"Fichier : {p.filename or '—'}"]
         if p.date is not None:
             details.append(f"Date : {format_date(p.date)}")
@@ -1814,7 +2103,8 @@ class PhotoViewer:
             details.append(f"Événement : {p.event_name}")
         if p.is_video:
             details.append("Type : vidéo")
-        self.info_details.config(text="     ".join(details))
+        self._details = "     ".join(details)
+        self.info_details.config(text=self._details)
         comment = p.comment if p.comment and p.comment != p.caption else ""
         self.info_comment.config(text=f"Commentaire : {comment}" if comment else "")
 
@@ -1842,11 +2132,11 @@ class PhotoViewer:
             path, origin = lib.find_display_file(p, for_thumbnail=False)
             if not path:
                 if not lib.is_available():
-                    self.results.put((no, None, "Bibliothèque inaccessible : le disque externe n'est pas connecté.", ""))
+                    self.results.put((no, None, "Bibliothèque inaccessible : le disque externe n'est pas connecté.", "", None))
                 elif file_ext(p.image_path) in RAW_EXTS and not p.original_path:
-                    self.results.put((no, None, "Format RAW sans aperçu JPEG exploitable : affichage impossible.", ""))
+                    self.results.put((no, None, "Format RAW sans aperçu JPEG exploitable : affichage impossible.", "", None))
                 else:
-                    self.results.put((no, None, "Fichier introuvable sur le disque.\n" + (lib.to_linux(p.image_path) or ""), ""))
+                    self.results.put((no, None, "Fichier introuvable sur le disque.\n" + safe_text(lib.to_linux(p.image_path) or ""), "", None))
                 return
             img = load_pil_image(path, self.max_w, self.max_h)
             note = ""
@@ -1862,16 +2152,20 @@ class PhotoViewer:
                 note = "Rendu JPEG du fichier RAW (enregistré par Photos)"
             elif origin == "image" and "/Previews/" in path:
                 note = "Version développée (Previews)"
-            self.results.put((no, img, "", note))
+            self.results.put((no, img, "", note, image_size(path)))
         except Exception as exc:
-            self.results.put((no, None, f"Impossible d'ouvrir cette image (fichier illisible ou corrompu).\n{exc}", ""))
+            detail = "format d'image non reconnu" if "cannot identify image file" in str(exc) else str(exc)
+            self.results.put((no, None, f"Impossible d'ouvrir cette image (fichier illisible ou corrompu).\n{detail}", "", None))
 
     def _poll(self) -> None:
         try:
             while True:
-                no, img, err, note = self.results.get_nowait()
+                no, img, err, note, dims = self.results.get_nowait()
                 if no != self.request_no:
                     continue
+                if dims:
+                    self.info_details.config(
+                        text=f"{self._details}     Dimensions : {dims[0]} × {dims[1]} px")
                 if img is None:
                     self._message(err, COLORS["missing"])
                 else:
@@ -2110,6 +2404,15 @@ class MainWindow:
         self._building = False
         self._build_queue: "queue.Queue[tuple]" = queue.Queue()
         self.current_album_id: Optional[int] = None
+        self._last_grid_msg: tuple[str, str] = ("", COLORS["muted"])
+
+        # Mode « Explorer un dossier »
+        self.mode = MODE_LIBRARY
+        self._mode_states: dict[str, dict] = {}
+        self.folder = FolderBrowser()
+        self._scanner: Optional[FolderScanner] = None
+        self._scan_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._scan_polling = False
 
         self._setup_style()
         self._build_ui()
@@ -2165,6 +2468,15 @@ class MainWindow:
         st.configure("Vertical.TScrollbar", background=c["tile"], troughcolor=c["panel"], arrowcolor=c["muted"],
                      borderwidth=0)
         st.configure("Horizontal.TProgressbar", background=c["accent"], troughcolor=c["tile"])
+        st.configure("Mode.Toolbutton", background=c["tile"], foreground=c["text"], padding=(12, 4), borderwidth=0)
+        st.map("Mode.Toolbutton", background=[("selected", c["accent"]), ("active", c["tile_hover"])],
+               foreground=[("selected", "white")])
+        st.configure("TCheckbutton", background=c["panel"], foreground=c["text"])
+        st.map("TCheckbutton", background=[("active", c["panel"])])
+        st.configure("Toolbar.TFrame", background=c["bg"])
+        st.configure("Toolbar.TLabel", background=c["bg"], foreground=c["muted"])
+        st.configure("Toolbar.TCheckbutton", background=c["bg"], foreground=c["text"])
+        st.map("Toolbar.TCheckbutton", background=[("active", c["bg"])])
 
     # -- construction de l'interface ---------------------------------------
     def _build_ui(self) -> None:
@@ -2176,9 +2488,11 @@ class MainWindow:
         self.m_recent = tk.Menu(m_file, tearoff=False)
         m_file.add_cascade(label="Bibliothèques récentes", menu=self.m_recent)
         self._rebuild_recent_menu()
+        m_file.add_command(label="Ouvrir un dossier…", command=self.open_folder_dialog,
+                           accelerator="Ctrl+Maj+O")
         m_file.add_separator()
-        m_file.add_command(label="Recharger la bibliothèque", command=lambda: self.start(False))
-        m_file.add_command(label="Reconstruire l'index", command=lambda: self.start(True))
+        m_file.add_command(label="Recharger", command=self.reload_current, accelerator="F5")
+        m_file.add_command(label="Reconstruire l'index de la bibliothèque", command=self.rebuild_index)
         m_file.add_separator()
         m_file.add_command(label="Vider le cache des miniatures", command=self.clear_thumb_cache)
         m_file.add_command(label="Informations sur le cache", command=self.show_cache_info)
@@ -2192,14 +2506,38 @@ class MainWindow:
         root.config(menu=menubar)
         root.bind_all("<Control-q>", lambda e: self.quit())
         root.bind_all("<Control-o>", lambda e: self.open_library_dialog())
+        root.bind_all("<Control-O>", lambda e: self.open_folder_dialog())
+        root.bind_all("<F5>", lambda e: self.reload_current())
         root.bind_all("<Control-f>", lambda e: self.search_entry.focus_set())
         root.protocol("WM_DELETE_WINDOW", self.quit)
+
+        # Barre des modes
+        toolbar = ttk.Frame(root, style="Toolbar.TFrame", padding=(12, 6))
+        toolbar.pack(side="top", fill="x")
+        self.mode_var = tk.StringVar(value=MODE_LIBRARY)
+        ttk.Radiobutton(toolbar, text="📚  Bibliothèque iPhoto", value=MODE_LIBRARY, variable=self.mode_var,
+                        style="Mode.Toolbutton", command=lambda: self.set_mode(self.mode_var.get())).pack(side="left")
+        ttk.Radiobutton(toolbar, text="🗂  Explorer un dossier", value=MODE_FOLDER, variable=self.mode_var,
+                        style="Mode.Toolbutton", command=lambda: self.set_mode(self.mode_var.get())).pack(side="left", padx=(2, 0))
+        ttk.Button(toolbar, text="📂  Ouvrir un dossier…", command=self.open_folder_dialog).pack(side="left", padx=(16, 0))
+        self.folder_opts = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        self.recursive_var = tk.BooleanVar(value=self.settings.folder_recursive)
+        ttk.Checkbutton(self.folder_opts, text="Inclure les sous-dossiers", variable=self.recursive_var,
+                        command=self._on_recursive_toggle, style="Toolbar.TCheckbutton").pack(side="left")
+        ttk.Label(self.folder_opts, text="Trier par :", style="Toolbar.TLabel").pack(side="left", padx=(16, 4))
+        labels = [lbl for lbl, _k, _d in FOLDER_SORTS]
+        self.sort_var = tk.StringVar(value=self.settings.folder_sort if self.settings.folder_sort in labels else labels[0])
+        self.sort_box = ttk.Combobox(self.folder_opts, textvariable=self.sort_var, state="readonly",
+                                     width=30, values=labels)
+        self.sort_box.pack(side="left")
+        self.sort_box.bind("<<ComboboxSelected>>", self._on_sort_change)
+        key, desc = self._sort_choice()
+        self.folder.sort_key, self.folder.sort_desc = key, desc
 
         # Barre supérieure
         top = ttk.Frame(root, style="Panel.TFrame", padding=(12, 8))
         top.pack(side="top", fill="x")
-        left = ttk.Frame(top, style="Panel.TFrame")
-        left.pack(side="left", fill="x", expand=True)
+        left = ttk.Frame(top, style="Panel.TFrame")   # placé après la recherche (voir plus bas)
         self.title_label = ttk.Label(left, text="iphotor", style="Title.TLabel")
         self.title_label.pack(anchor="w")
         self.subtitle_label = ttk.Label(left, text="", style="Muted.TLabel")
@@ -2225,8 +2563,11 @@ class MainWindow:
         self.scope = ttk.Combobox(search, textvariable=self.scope_var, state="readonly", width=20,
                                   values=("Toute la photothèque", "Album sélectionné"))
         self.scope.pack(side="left", padx=(6, 0))
-        ttk.Button(search, text="Rechercher", command=self.do_search).pack(side="left", padx=(6, 0))
+        self.btn_search = ttk.Button(search, text="Rechercher", command=self.do_search)
+        self.btn_search.pack(side="left", padx=(6, 0))
         ttk.Button(search, text="✕", width=3, command=self.clear_search).pack(side="left", padx=(4, 0))
+        # Le titre prend la place restante : un long chemin n'écrase plus la recherche.
+        left.pack(side="left", fill="x", expand=True)
 
         # Barre d'état
         self.status_var = tk.StringVar(value="")
@@ -2237,7 +2578,10 @@ class MainWindow:
         body = tk.PanedWindow(root, orient="horizontal", sashwidth=5, bg=COLORS["bg"], bd=0)
         body.pack(side="top", fill="both", expand=True)
 
-        tree_frame = ttk.Frame(body, style="Panel.TFrame")
+        left_pane = ttk.Frame(body, style="Panel.TFrame")
+        tree_frame = ttk.Frame(left_pane, style="Panel.TFrame")
+        tree_frame.pack(fill="both", expand=True)
+        self.tree_frame = tree_frame
         self.tree = ttk.Treeview(tree_frame, columns=("n",), show="tree", selectmode="browse")
         self.tree.column("#0", width=380, stretch=True)
         self.tree.column("n", width=60, anchor="e", stretch=False)
@@ -2250,7 +2594,20 @@ class MainWindow:
         self.tree.tag_configure("folder", foreground="#d8c88a")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
-        body.add(tree_frame, minsize=220, width=460)
+
+        self.ftree_frame = ttk.Frame(left_pane, style="Panel.TFrame")
+        self.ftree = ttk.Treeview(self.ftree_frame, columns=("n",), show="tree", selectmode="browse")
+        self.ftree.column("#0", width=380, stretch=True)
+        self.ftree.column("n", width=60, anchor="e", stretch=False)
+        fsb = ttk.Scrollbar(self.ftree_frame, orient="vertical", command=self.ftree.yview)
+        self.ftree.configure(yscrollcommand=fsb.set)
+        self.ftree.pack(side="left", fill="both", expand=True)
+        fsb.pack(side="right", fill="y")
+        self.ftree.tag_configure("section", font=self.font_bold, foreground=COLORS["accent"])
+        self.ftree.tag_configure("folder", foreground="#d8c88a")
+        self.ftree.tag_configure("error", foreground=COLORS["missing"])
+        self.ftree.bind("<<TreeviewSelect>>", self._on_ftree_select)
+        body.add(left_pane, minsize=220, width=460)
 
         grid_frame = ttk.Frame(body, style="Bg.TFrame")
         self.canvas = tk.Canvas(grid_frame, bg=COLORS["bg"], highlightthickness=0)
@@ -2282,6 +2639,9 @@ class MainWindow:
     # -- choix de la bibliothèque -----------------------------------------------
     def _update_title(self) -> None:
         name = os.path.basename(self.library.root) or self.library.root
+        if self.mode == MODE_FOLDER and not name:
+            name = "Explorer un dossier"
+        name = safe_text(name)
         self.root.title(f"{name} — iphotor {APP_VERSION}")
 
     def _rebuild_recent_menu(self) -> None:
@@ -2321,6 +2681,8 @@ class MainWindow:
             messagebox.showerror("Cache inaccessible", f"Impossible de préparer le cache local :\n{exc}",
                                  parent=self.root)
             return
+        if self.mode != MODE_LIBRARY:
+            self.set_mode(MODE_LIBRARY, restore=False)
         if self.viewer is not None and self.viewer.win.winfo_exists():
             self.viewer.close()
         self.loader.shutdown()
@@ -2334,6 +2696,348 @@ class MainWindow:
         self.current_album_id = None
         self.status_var.set("")
         self.start(False)
+
+    # -- modes : bibliothèque iPhoto / explorer un dossier ---------------------------
+    # Attributs propres à chaque mode, sauvegardés et restaurés lors d'un changement de mode.
+    _MODE_ATTRS = ("library", "cache", "loader", "photos", "view", "total", "page_no",
+                   "view_ids", "current_album_id")
+
+    def _initial_folder_state(self) -> dict:
+        lib = FolderLibrary("")
+        cache = FolderThumbCache(lib)
+        return {
+            "library": lib, "cache": cache, "loader": ThumbnailLoader(lib, cache),
+            "photos": None, "view": View("empty", title="Explorer un dossier"), "total": 0,
+            "page_no": 0, "view_ids": None, "current_album_id": None, "search": "",
+            "title": "Explorer un dossier", "subtitle": "Aucun dossier ouvert", "status": "",
+            "yview": 0.0,
+            "grid_msg": ("Cliquez sur « Ouvrir un dossier… » pour afficher les images d'un dossier\n"
+                         "de l'ordinateur ou d'un disque externe.\n\n"
+                         "Formats affichés : JPG, JPEG, PNG, GIF, BMP et TIFF.\n"
+                         "Les fichiers consultés ne sont jamais modifiés.", COLORS["muted"]),
+        }
+
+    def set_mode(self, mode: str, restore: bool = True) -> None:
+        """Passe d'un mode à l'autre en conservant l'état de navigation de chacun."""
+        if mode == self.mode:
+            self.mode_var.set(mode)
+            return
+        if self._building:
+            messagebox.showinfo("Indexation en cours",
+                                "Attendez la fin de l'indexation de la bibliothèque avant de changer de mode.",
+                                parent=self.root)
+            self.mode_var.set(self.mode)
+            return
+        state = {a: getattr(self, a) for a in self._MODE_ATTRS}
+        state.update(search=self.search_var.get(), title=self.title_label.cget("text"),
+                     subtitle=self.subtitle_label.cget("text"), status=self.status_var.get(),
+                     yview=self.canvas.yview()[0], grid_msg=self._last_grid_msg)
+        self._mode_states[self.mode] = state
+        if self.viewer is not None and self.viewer.win.winfo_exists():
+            self.viewer.close()
+        self._clear_grid()
+        self.progress.stop()
+        self.progress.place_forget()
+
+        self.mode = mode
+        self.mode_var.set(mode)
+        new = self._mode_states.get(mode) or self._initial_folder_state()
+        for a in self._MODE_ATTRS:
+            setattr(self, a, new[a])
+        self.search_var.set(new["search"])
+        self.title_label.config(text=new["title"])
+        self.subtitle_label.config(text=new["subtitle"])
+        self.status_var.set(new["status"])
+        self._apply_mode_widgets()
+        if not restore:
+            return
+        self._update_nav()
+        if self.photos is not None and self.view.kind != "empty" and self.total > 0:
+            self.load_page()
+            if new.get("yview"):
+                self.canvas.yview_moveto(new["yview"])
+        else:
+            self._show_grid_message(*new["grid_msg"])
+        if mode == MODE_FOLDER:
+            if self._scanner is not None:
+                self._show_scan_progress()
+            elif (not self.folder.root and self.settings.last_folder
+                  and os.path.isdir(self.settings.last_folder)):
+                self.open_folder(self.settings.last_folder)
+
+    def _apply_mode_widgets(self) -> None:
+        if self.mode == MODE_FOLDER:
+            self.tree_frame.pack_forget()
+            self.ftree_frame.pack(fill="both", expand=True)
+            self.scope.pack_forget()
+            self.folder_opts.pack(side="left", padx=(24, 0))
+            self.search_entry.configure(width=36)
+        else:
+            self.ftree_frame.pack_forget()
+            self.tree_frame.pack(fill="both", expand=True)
+            self.folder_opts.pack_forget()
+            self.scope.pack(side="left", padx=(6, 0), before=self.btn_search)
+            self.search_entry.configure(width=30)
+        self._update_title()
+
+    def reload_current(self) -> None:
+        if self.mode == MODE_FOLDER:
+            if self.library.root:
+                self.open_folder(self.library.root)
+            else:
+                self.open_folder_dialog()
+        else:
+            self.start(False)
+
+    def rebuild_index(self) -> None:
+        if self.mode != MODE_LIBRARY:
+            self.set_mode(MODE_LIBRARY, restore=False)
+            if self.mode != MODE_LIBRARY:
+                return
+        self.start(True)
+
+    # -- explorer un dossier ----------------------------------------------------------
+    def open_folder_dialog(self) -> None:
+        if self._building:
+            messagebox.showinfo("Indexation en cours",
+                                "Attendez la fin de l'indexation de la bibliothèque.", parent=self.root)
+            return
+        initial = (self.library.root if self.mode == MODE_FOLDER and self.library.root else
+                   self.settings.last_folder) or os.path.expanduser("~")
+        if not os.path.isdir(initial):
+            initial = os.path.expanduser("~")
+        path = filedialog.askdirectory(parent=self.root, title="Ouvrir un dossier d'images",
+                                       initialdir=initial, mustexist=True)
+        if not path:
+            return
+        if self.mode != MODE_FOLDER:
+            self.set_mode(MODE_FOLDER, restore=False)
+            if self.mode != MODE_FOLDER:
+                return
+        self.open_folder(path)
+
+    def open_folder(self, path: str) -> None:
+        """Analyse un dossier (lecture seule) dans un thread, puis affiche ses images."""
+        path = os.path.abspath(path)
+        if not os.path.isdir(path):
+            messagebox.showerror("Dossier inaccessible",
+                                 f"Ce dossier n'existe pas ou n'est plus accessible :\n{safe_text(path)}\n\n"
+                                 "Vérifiez que le disque qui le contient est bien branché.", parent=self.root)
+            return
+        if not os.access(path, os.R_OK | os.X_OK):
+            messagebox.showerror("Dossier inaccessible",
+                                 f"Vous n'avez pas le droit de lire ce dossier :\n{safe_text(path)}",
+                                 parent=self.root)
+            return
+        if self._scanner is not None:
+            self._scanner.cancel()
+        if self.viewer is not None and self.viewer.win.winfo_exists():
+            self.viewer.close()
+        lib = FolderLibrary(path)
+        cache = FolderThumbCache(lib)
+        try:
+            cache.ensure_dirs()
+        except (PermissionError, OSError):
+            pass   # miniatures non mises en cache (le cache se trouverait dans le dossier consulté)
+        self._clear_grid()
+        self.loader.shutdown()
+        self.library, self.cache = lib, cache
+        self.loader = ThumbnailLoader(lib, cache)
+        self.photos = None
+        self.view = View("empty", title="Analyse du dossier")
+        self.total = 0
+        self.page_no = 0
+        self.view_ids = None
+        self.search_var.set("")
+        self.ftree.delete(*self.ftree.get_children())
+        self._update_nav()
+        self._update_title()
+
+        recursive = bool(self.recursive_var.get())
+        self.settings.last_folder = path
+        self.settings.folder_recursive = recursive
+        self.settings.save()
+
+        scanner = FolderScanner(path, recursive)
+        self._scanner = scanner
+        self._show_scan_progress()
+
+        def run():
+            try:
+                scanner.run(progress=lambda d, n: self._scan_queue.put(("progress", scanner, d, n)))
+                self._scan_queue.put(("done", scanner, None, 0))
+            except Exception as exc:
+                traceback.print_exc()
+                self._scan_queue.put(("error", scanner, exc, 0))
+
+        threading.Thread(target=run, daemon=True, name="analyse-dossier").start()
+        if not self._scan_polling:
+            self._scan_polling = True
+            self.root.after(100, self._poll_scan)
+
+    def _show_scan_progress(self, text: str = "Recherche des images…") -> None:
+        if self.mode != MODE_FOLDER or self._scanner is None:
+            return
+        sc = self._scanner
+        self.title_label.config(text="Analyse du dossier")
+        self.subtitle_label.config(text=safe_text(sc.root) + ("   ·   sous-dossiers inclus" if sc.recursive else ""))
+        self._show_grid_message(text, COLORS["text"])
+        self.progress.place(relx=0.5, rely=0.58, anchor="center")
+        self.progress.start(12)
+
+    def _poll_scan(self) -> None:
+        try:
+            while True:
+                kind, scanner, a, b = self._scan_queue.get_nowait()
+                if scanner is not self._scanner:
+                    continue   # analyse annulée (autre dossier choisi entre-temps)
+                if kind == "progress":
+                    text = (f"Recherche des images…\n{plural(a, 'dossier parcouru', 'dossiers parcourus')}, "
+                            f"{plural(b, 'image trouvée', 'images trouvées')}")
+                    if self.mode == MODE_FOLDER:
+                        self._show_grid_message(text, COLORS["text"])
+                    elif MODE_FOLDER in self._mode_states:
+                        self._mode_states[MODE_FOLDER]["grid_msg"] = (text, COLORS["text"])
+                else:
+                    self._scanner = None
+                    self._finish_scan(scanner, a if kind == "error" else None)
+        except queue.Empty:
+            pass
+        if self._scanner is not None:
+            self.root.after(100, self._poll_scan)
+        else:
+            self._scan_polling = False
+
+    def _finish_scan(self, scanner: FolderScanner, error: Optional[Exception]) -> None:
+        active = self.mode == MODE_FOLDER
+        if active:
+            self.progress.stop()
+            self.progress.place_forget()
+        if error is not None:
+            msg = f"L'analyse du dossier a échoué :\n{error}"
+            if active:
+                self._show_grid_message(msg, COLORS["missing"])
+            else:
+                self._mode_states[MODE_FOLDER]["grid_msg"] = (msg, COLORS["missing"])
+            return
+        self.folder.load(scanner)
+        self._populate_ftree()
+        summary = f"{plural(len(self.folder.photos), 'image')} dans {plural(scanner.dirs_seen, 'dossier')}"
+        if scanner.errors:
+            summary += f"   ·   ⚠ {plural(len(scanner.errors), 'dossier inaccessible', 'dossiers inaccessibles')}"
+        if scanner.unreadable:
+            summary += f"   ·   ⚠ {plural(scanner.unreadable, 'fichier illisible', 'fichiers illisibles')}"
+        if not self.cache.usable():
+            summary += "   ·   miniatures non mises en cache (le cache se trouve dans ce dossier)"
+        if active:
+            self.photos = self.folder
+            self.set_view(self._folder_view())
+            self._set_status(summary)
+        else:
+            view = self._folder_view()
+            self._mode_states[MODE_FOLDER].update(
+                photos=self.folder, view=view, total=self.folder.count(), page_no=0, view_ids=None,
+                yview=0.0, title=view.title, subtitle=self._folder_subtitle(), status=summary)
+        self._select_ftree("f:")
+
+    def _select_ftree(self, iid: str) -> None:
+        """Sélectionne une entrée de l'arborescence sans recharger la grille."""
+        self._ftree_silent = True
+        self.ftree.selection_set(iid)
+        self.ftree.focus(iid)
+        self.root.after_idle(lambda: setattr(self, "_ftree_silent", False))
+
+    def _populate_ftree(self) -> None:
+        t = self.ftree
+        t.delete(*t.get_children())
+        f = self.folder
+        if not f.root:
+            return
+        totals: dict[str, int] = {"": 0}
+        for rel, n in f.dir_counts.items():
+            parts = rel.split("/") if rel else []
+            for k in range(len(parts) + 1):
+                key = "/".join(parts[:k])
+                totals[key] = totals.get(key, 0) + n
+        name = os.path.basename(f.root) or f.root
+        t.insert("", "end", iid="f:", text="🗂  " + safe_text(name), values=(format_count(totals[""]),),
+                 tags=("section",), open=True)
+        for rel in sorted((k for k in totals if k), key=lambda k: (k.count("/"), natural_key(k))):
+            parent = rel.rpartition("/")[0]
+            t.insert("f:" + parent, "end", iid="f:" + rel, text="📁 " + rel.rpartition("/")[2],
+                     values=(format_count(totals[rel]),), tags=("folder",))
+        if f.errors:
+            t.insert("", "end", iid="err", text="⚠  Dossiers inaccessibles", values=(format_count(len(f.errors)),),
+                     tags=("error",))
+            for i, (rel, _reason) in enumerate(f.errors):
+                t.insert("err", "end", iid=f"err:{i}", text=safe_text(rel), tags=("error",))
+
+    def _on_ftree_select(self, _event=None) -> None:
+        if self.mode != MODE_FOLDER or not self.folder.root or getattr(self, "_ftree_silent", False):
+            return
+        sel = self.ftree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        if iid == "err":
+            self._set_status(f"⚠ {plural(len(self.folder.errors), 'dossier n’a', 'dossiers n’ont')} pas pu être "
+                             "lus (droits insuffisants ou erreur de lecture) : ils sont ignorés.")
+            return
+        if iid.startswith("err:"):
+            rel, reason = self.folder.errors[int(iid[4:])]
+            self._set_status(f"⚠ Dossier inaccessible : {safe_text(rel)} — {reason}")
+            return
+        self.folder.subdir = iid[2:] or None
+        self.folder.refresh()
+        self.photos = self.folder
+        self.set_view(self._folder_view())
+        self._set_status(safe_text(os.path.join(self.folder.root, self.folder.subdir or "")))
+
+    def _folder_view(self) -> View:
+        f = self.folder
+        name = f.subdir.rpartition("/")[2] if f.subdir else (os.path.basename(f.root) or f.root)
+        title = f"Recherche « {f.query} » dans {name}" if f.query else f"Dossier : {name}"
+        return View("folder", query=f.query, title=safe_text(title))
+
+    def _folder_subtitle(self) -> str:
+        f = self.folder
+        path = os.path.join(f.root, f.subdir) if f.subdir else f.root
+        sub = f"{plural(f.count(), 'image')}   ·   {safe_text(path)}"
+        if f.recursive:
+            sub += "   ·   sous-dossiers inclus"
+        return sub
+
+    def _folder_search(self) -> None:
+        if not self.folder.root or self.photos is None:
+            return
+        q = self.search_var.get().strip()
+        self.folder.query = q
+        self.folder.refresh()
+        self.set_view(self._folder_view())
+        if q:
+            self._set_status(f"Recherche « {q} » : {plural(self.folder.count(), 'image')} "
+                             "dont le nom contient ce texte.")
+
+    def _sort_choice(self) -> tuple[str, bool]:
+        for label, key, desc in FOLDER_SORTS:
+            if label == self.sort_var.get():
+                return key, desc
+        return "name", False
+
+    def _on_sort_change(self, _event=None) -> None:
+        self.sort_box.selection_clear()
+        self.settings.folder_sort = self.sort_var.get()
+        self.settings.save()
+        key, desc = self._sort_choice()
+        self.folder.set_sort(key, desc)
+        if self.mode == MODE_FOLDER and self.photos is not None:
+            self.set_view(self._folder_view())
+
+    def _on_recursive_toggle(self) -> None:
+        self.settings.folder_recursive = bool(self.recursive_var.get())
+        self.settings.save()
+        if self.mode == MODE_FOLDER and self.library.root:
+            self.open_folder(self.library.root)
 
     # -- démarrage / indexation ----------------------------------------------
     def start(self, force_reindex: bool) -> None:
@@ -2361,7 +3065,8 @@ class MainWindow:
                 self.title_label.config(text="Bibliothèque inaccessible")
                 self.subtitle_label.config(text=self.library.root)
                 self._set_status("Bibliothèque inaccessible et aucun index en cache : "
-                                 "choisissez une bibliothèque (Fichier › Ouvrir une bibliothèque…).")
+                                 "choisissez une bibliothèque (Fichier › Ouvrir une bibliothèque…) "
+                                 "ou explorez un dossier.")
                 self.root.after(400, self.open_library_dialog)
             return
         self._open_db()
@@ -2592,6 +3297,8 @@ class MainWindow:
             message = f"Erreur de lecture de l'index : {exc}"
         self.title_label.config(text=view.title or "iphotor")
         sub = plural(self.total, "photo") if view.kind != "empty" else ""
+        if view.kind == "folder":
+            sub = self._folder_subtitle()
         if view.kind == "album" and self.albums:
             a = self.albums.get(view.album_id)
             if a:
@@ -2640,6 +3347,13 @@ class MainWindow:
                     message = f"Aucune photo ne correspond à « {self.view.query} »."
                 elif self.view.kind == "album":
                     message = "Cet album ne contient aucune photo."
+                elif self.view.kind == "folder":
+                    if self.folder.query:
+                        message = f"Aucune image dont le nom contient « {self.folder.query} »."
+                    else:
+                        message = ("Aucune image (JPG, PNG, GIF, BMP, TIFF) dans ce dossier."
+                                   + ("" if self.folder.recursive else
+                                      "\nCochez « Inclure les sous-dossiers » pour chercher plus loin."))
             self._show_grid_message(message)
             return
         try:
@@ -2724,6 +3438,8 @@ class MainWindow:
         sub = format_date(p.date, with_time=False) if p.date is not None else ""
         if p.label != p.filename and p.filename:
             sub = (sub + "  ·  " if sub else "") + p.filename
+        if p.source == "folder":
+            sub = (sub + "  ·  " if sub else "") + format_size(p.size)
         c.create_text(cx, y + THUMB_SIZE + 40, text=self._truncate(sub, self.font_small, text_w),
                       fill=COLORS["muted"], font=self.font_small, tags=(tag,))
 
@@ -2733,6 +3449,7 @@ class MainWindow:
             self._draw_tile(i, self.page_photos[i])
 
     def _show_grid_message(self, text: str, color: str = COLORS["muted"]) -> None:
+        self._last_grid_msg = (text, color)
         self.canvas.delete("all")
         if not text:
             return
@@ -2777,6 +3494,16 @@ class MainWindow:
         if i is not None:
             self.canvas.itemconfigure(f"bg{i}", fill=COLORS["tile_hover"])
             p = self.page_photos[i]
+            if p.source == "folder":
+                parts = [safe_text(p.image_path), format_size(p.size)]
+                if p.date is not None:
+                    parts.append(format_date(p.date))
+                state = self.tile_images.get(i)
+                if isinstance(state, dict) and state.get("status") == "error":
+                    parts.append("⚠ image illisible")
+                self.status_var.set("   ·   ".join(parts))
+                self.canvas.configure(cursor="hand2")
+                return
             parts = [p.filename]
             if p.caption and p.caption != os.path.splitext(p.filename)[0]:
                 parts.append(f"« {p.caption} »")
@@ -2845,6 +3572,9 @@ class MainWindow:
         return View("search", query=q, title=f"Recherche « {q} » dans toute la photothèque")
 
     def do_search(self) -> None:
+        if self.mode == MODE_FOLDER:
+            self._folder_search()
+            return
         if self.photos is None:
             return
         q = self.search_var.get().strip()
@@ -2879,6 +3609,9 @@ class MainWindow:
 
     def clear_search(self) -> None:
         self.search_var.set("")
+        if self.mode == MODE_FOLDER:
+            self._folder_search()
+            return
         if self.tree.exists("search"):
             self.tree.delete("search")
             if self.tree.exists("all"):
@@ -2886,17 +3619,33 @@ class MainWindow:
 
     # -- menus -------------------------------------------------------------------
     def clear_thumb_cache(self) -> None:
+        what = ("Les dossiers consultés ne sont pas concernés." if self.mode == MODE_FOLDER
+                else "La bibliothèque iPhoto n'est pas concernée.")
         if messagebox.askyesno("Vider le cache",
                                "Supprimer les miniatures enregistrées dans le cache local ?\n"
-                               f"({self.cache.thumb_dir})\n\nLa bibliothèque iPhoto n'est pas concernée.",
+                               f"({self.cache.thumb_dir})\n\n{what}",
                                parent=self.root):
             self.loader.cancel_pending()
-            self.cache.clear_thumbnails()
+            try:
+                self.cache.clear_thumbnails()
+            except (PermissionError, OSError) as exc:
+                messagebox.showerror("Cache", f"Impossible de vider le cache :\n{exc}", parent=self.root)
+                return
             self.load_page()
             self._set_status("Cache des miniatures vidé.")
 
     def show_cache_info(self) -> None:
         count, size = self.cache.thumbnails_size()
+        if self.mode == MODE_FOLDER:
+            messagebox.showinfo(
+                "Cache local",
+                f"Dossier du cache : {self.cache.cache_dir}\n\n"
+                f"Miniatures en cache : {format_count(count)} ({size / 1e6:.1f} Mo)\n\n"
+                f"Dossier consulté : {safe_text(self.library.root) or '—'}\n"
+                f"Images trouvées : {format_count(len(self.folder.photos))}\n"
+                "Le dossier consulté n'est jamais modifié.",
+                parent=self.root)
+            return
         meta = self.cache.read_meta()
         idx_size = os.path.getsize(self.cache.index_path) if os.path.isfile(self.cache.index_path) else 0
         messagebox.showinfo(
@@ -2913,7 +3662,8 @@ class MainWindow:
         messagebox.showinfo(
             "Raccourcis clavier",
             "Fenêtre principale :\n"
-            "  Ctrl+O : ouvrir une autre bibliothèque\n  Ctrl+F : rechercher\n  Page préc. / Page suiv. : changer de page\n  Ctrl+Q : quitter\n\n"
+            "  Ctrl+O : ouvrir une autre bibliothèque\n  Ctrl+Maj+O : ouvrir un dossier\n"
+            "  Ctrl+F : rechercher\n  F5 : recharger\n  Page préc. / Page suiv. : changer de page\n  Ctrl+Q : quitter\n\n"
             "Visionneuse :\n"
             "  ← / → (ou Espace) : photo précédente / suivante\n  Début / Fin : première / dernière photo\n"
             "  Échap : fermer",
@@ -2922,15 +3672,21 @@ class MainWindow:
     def show_about(self) -> None:
         messagebox.showinfo(
             "À propos",
-            f"iphotor {APP_VERSION}\n\nExplorateur en lecture seule d'une bibliothèque iPhoto.\n"
-            "La bibliothèque n'est jamais modifiée : l'index et les miniatures sont stockés dans\n"
-            f"{self.cache.cache_dir}",
+            f"iphotor {APP_VERSION}\n\nExplorateur en lecture seule de bibliothèques iPhoto / Photos\n"
+            "et de dossiers d'images.\n"
+            "Les bibliothèques et les dossiers consultés ne sont jamais modifiés : l'index et les\n"
+            f"miniatures sont stockés dans\n{CACHE_DIR}",
             parent=self.root)
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
 
     def quit(self) -> None:
+        if self._scanner is not None:
+            self._scanner.cancel()
+        for st in self._mode_states.values():
+            if st.get("loader") is not None and st["loader"] is not self.loader:
+                st["loader"].shutdown()
         self.loader.shutdown()
         self._close_db()
         self.root.destroy()
