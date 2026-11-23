@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=iphotor
+GenericName=Explorateur de bibliothèques iPhoto et Photos
+Comment=Parcourir une ancienne bibliothèque iPhoto ou Photos en lecture seule
+Exec=iphotor
+Icon=iphotor
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=iPhoto;photo;album;événement;
+StartupWMClass=Iphotor
