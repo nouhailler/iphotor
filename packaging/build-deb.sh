@@ -14,10 +14,16 @@ trap 'rm -rf "$BUILD"' EXIT
 D="$BUILD/$PKG"
 
 install -Dm755 "$ROOT/iphotor.py"          "$D/usr/bin/iphotor"
+for f in "$ROOT"/iphotorlib/*.py; do
+    install -Dm644 "$f" "$D/usr/share/iphotor/iphotorlib/$(basename "$f")"
+done
 install -Dm644 "$HERE/iphotor.desktop"     "$D/usr/share/applications/iphotor.desktop"
 install -Dm644 "$HERE/iphotor.svg"         "$D/usr/share/icons/hicolor/scalable/apps/iphotor.svg"
 install -Dm644 "$ROOT/README.md"           "$D/usr/share/doc/iphotor/README.md"
 install -Dm644 "$ROOT/CONTEXT.md"          "$D/usr/share/doc/iphotor/CONTEXT.md"
+for f in guide-fonctionnalites.md guide-securite-donnees.md; do
+    [ -f "$ROOT/docs/$f" ] && install -Dm644 "$ROOT/docs/$f" "$D/usr/share/doc/iphotor/$f"
+done
 gzip -9n -c "$ROOT/CHANGELOG.md" > "$BUILD/changelog.gz"
 install -Dm644 "$BUILD/changelog.gz"       "$D/usr/share/doc/iphotor/changelog.gz"
 cat > "$BUILD/copyright" <<COPY
@@ -41,7 +47,7 @@ Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-tk, python3-pil, python3-pil.imagetk
 Recommends: xdg-utils, python3-gi, gir1.2-gdkpixbuf-2.0, gir1.2-gtk-3.0, heif-gdk-pixbuf
-Suggests: wl-clipboard, xclip, libimage-exiftool-perl
+Suggests: wl-clipboard, xclip, libimage-exiftool-perl, python3-pillow-heif
 Installed-Size: $SIZE
 Maintainer: Mainteneurs d'iphotor <iphotor@users.noreply.github.com>
 Description: explorateur en lecture seule de bibliothèques iPhoto et Photos
@@ -58,9 +64,15 @@ Description: explorateur en lecture seule de bibliothèques iPhoto et Photos
  marquée comme favorite ou classée par tags, et ses informations EXIF
  affichées.
  .
+ Version 2 : sélection multiple et actions groupées, recherche avancée
+ multicritère (dates, appareil, objectif, ISO, GPS, tags…), chronologie,
+ albums virtuels multi-sources et albums intelligents, détection des
+ doublons, comparaison de photos, statistiques, carte hors ligne des photos
+ géolocalisées, diaporama, export CSV / JSON des métadonnées.
+ .
  La bibliothèque n'est jamais modifiée : l'index et les miniatures sont
- stockés dans ~/.cache/photoexplorer_iphoto/, les favoris et les tags dans
- ~/.local/share/iphotor/.
+ stockés dans ~/.cache/photoexplorer_iphoto/, les favoris, les tags et les
+ albums virtuels dans ~/.local/share/iphotor/.
 CTRL
 cat > "$D/DEBIAN/postinst" <<'POST'
 #!/bin/sh

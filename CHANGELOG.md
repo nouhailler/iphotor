@@ -4,7 +4,25 @@ Toutes les évolutions notables d'iphotor sont consignées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions selon
 [Semantic Versioning](https://semver.org/lang/fr/).
 
-## [1.5.0] — 2026-11-27
+## [2.0.0] — 2026-11-27
+
+Évolution fonctionnelle majeure. Détails : [docs/guide-fonctionnalites.md](docs/guide-fonctionnalites.md),
+[docs/rapport-final-v2.md](docs/rapport-final-v2.md).
+
+### Ajouté
+- Sélection multiple (Ctrl+clic, Maj+clic, Ctrl+A, Échap) et barre d'actions groupées.
+- Recherche avancée multicritère (ET/OU), recherches enregistrées, albums intelligents.
+- Chronologie (années, mois, jours).
+- Albums virtuels multi-sources (source « Collections »).
+- Index des métadonnées incrémental (EXIF, GPS), statistiques, carte hors ligne.
+- Détection des doublons et quasi-doublons (sans suppression), comparaison de photos.
+- Diaporama, export CSV / JSON, dossiers récents et favoris, surveillance passive.
+- Import expérimental des mots-clés, personnes et lieux Apple.
+- Surveillance des disques externes, diagnostic (`--diagnostic`), nettoyage des caches.
+- RAW et HEIC en mode dossier ; rawpy et pillow-heif facultatifs.
+- Paquet `iphotorlib` et suite de tests (`tests/`).
+
+ — 2026-11-27
 
 Modernisation complète de l'interface. Aucune fonctionnalité, aucun raccourci et aucune règle
 de lecture seule ne change. Détails et captures avant/après :
@@ -202,6 +220,7 @@ Première version fonctionnelle.
 - Le nom d'événement est stocké dans la table `photos`, pour garder des requêtes paginées
   sous 0,1 s.
 
+[2.0.0]: ../../releases/tag/v2.0.0
 [1.5.0]: ../../releases/tag/v1.5.0
 [1.4.0]: ../../releases/tag/v1.4.0
 [1.3.0]: ../../releases/tag/v1.3.0

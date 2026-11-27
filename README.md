@@ -7,9 +7,19 @@ de l'ordinateur ou d'un disque externe. Les photos peuvent être copiées (press
 dossier de destination), marquées comme favorites, classées par tags, et leurs informations
 EXIF affichées. L'interface propose un thème clair (par défaut) et un thème sombre.
 
-![Fenêtre principale d'iphotor](docs/captures/apres/01_principale_toutes.png)
+**Nouveautés de la version 2** (détails : [guide des fonctionnalités](docs/guide-fonctionnalites.md)) :
+- sélection multiple (Ctrl+clic, Maj+clic) et actions groupées ;
+- recherche avancée multicritère (dates, appareil, objectif, ISO, GPS, tags…), recherches
+  enregistrées et albums intelligents ;
+- chronologie par année, mois et jour ;
+- albums virtuels regroupant des photos de plusieurs sources, sans copie ;
+- détection des doublons (sans jamais rien supprimer) et comparaison de photos ;
+- statistiques, carte hors ligne des photos géolocalisées, diaporama, export CSV / JSON ;
+- dossiers récents et favoris, surveillance des disques externes, diagnostic.
 
-Version actuelle : **1.5.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
+![Fenêtre principale d'iphotor](docs/captures/v2/01_selection_multiple.png)
+
+Version actuelle : **2.0.0** (nouveautés : [guide des fonctionnalités](docs/guide-fonctionnalites.md)). Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
 [CONTEXT.md](CONTEXT.md) pour le contexte, les contraintes et la structure des bibliothèques
 (AlbumData.xml d'iPhoto, base SQLite de Photos).
 
@@ -22,9 +32,9 @@ Version actuelle : **1.5.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 | Bibliothèque Photos 5 et suivantes (macOS 10.15+) | non (`Photos.sqlite`)                     |
 | JPEG, PNG, BMP, GIF, TIFF      | oui                                                          |
 | HEIC (iPhone)                  | oui, si les paquets HEIC facultatifs sont installés          |
-| RAW (CR2, NEF, ARW, DNG, PEF, SRW) | oui : JPEG généré par iPhoto/Photos, sinon aperçu intégré au fichier |
+| RAW (CR2, NEF, ARW, DNG, PEF, SRW) | oui : JPEG généré par iPhoto/Photos, sinon aperçu intégré au fichier, sinon `rawpy` (facultatif) |
 | Vidéos (MOV, MP4, AVI, MPG…)   | vignette seulement ; lecture avec l'application par défaut   |
-| Dossier quelconque             | oui (mode « Explorer un dossier ») : JPG, JPEG, PNG, GIF, BMP, TIFF |
+| Dossier quelconque             | oui (mode « Explorer un dossier ») : JPG, PNG, GIF, BMP, TIFF, RAW, HEIC |
 
 ## 2. Dépendances
 
@@ -37,6 +47,11 @@ Version actuelle : **1.5.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 | `python3-gi`, `gir1.2-gdkpixbuf-2.0`, `heif-gdk-pixbuf` | facultatifs : photos HEIC (iPhone) |
 | `gir1.2-gtk-3.0`, ou `wl-clipboard` / `xclip` | facultatifs : copier une image dans le presse-papiers |
 | `libimage-exiftool-perl` | facultatif : informations EXIF des fichiers HEIC                |
+| `python3-pillow-heif`  | facultatif : HEIC via Pillow (affichage et EXIF)                  |
+| `rawpy` (pip)          | facultatif : développement des RAW sans aperçu intégré            |
+
+Aucune nouvelle dépendance obligatoire en version 2. *Aide › Diagnostic* (ou `iphotor --diagnostic`)
+indique les modules facultatifs présents.
 
 `plistlib`, `sqlite3`, `threading`… font partie de la bibliothèque standard.
 
@@ -44,11 +59,11 @@ Version actuelle : **1.5.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 
 ### Option A : paquet .deb (recommandé)
 
-Téléchargez `iphotor_1.5.0_all.deb` depuis la
+Téléchargez `iphotor_2.0.0_all.deb` depuis la
 [page des releases](../../releases), puis :
 
 ```bash
-sudo apt install ./iphotor_1.5.0_all.deb
+sudo apt install ./iphotor_2.0.0_all.deb
 ```
 
 `apt` installe automatiquement les dépendances. L'application apparaît dans le menu
@@ -77,6 +92,9 @@ sudo apt install python3-gi gir1.2-gdkpixbuf-2.0 heif-gdk-pixbuf
 chmod +x iphotor.py
 ```
 
+Gardez le dossier `iphotorlib/` à côté de `iphotor.py` : il contient la logique des
+fonctionnalités de la version 2.
+
 Aucune connexion Internet ni serveur n'est nécessaire.
 
 ## 4. Lancement
@@ -92,6 +110,7 @@ Options :
 | `--bibliotheque CHEMIN` (`-b`)  | bibliothèque à ouvrir (défaut : la dernière ouverte, sinon `~/Pictures/iPhoto Library`) |
 | `--reindexer`                   | force la reconstruction de l'index au démarrage              |
 | `--verifier`                    | contrôle de cohérence albums/dossiers/événements/photos, sans interface |
+| `--diagnostic`                  | dépendances facultatives et emplacements des données, sans interface |
 
 La variable d'environnement `IPHOTOR_LIBRARY` peut aussi indiquer le chemin.
 
@@ -102,7 +121,8 @@ n'est trouvée au démarrage, la fenêtre « Ouvrir une bibliothèque » s'affic
 
 ## 5. Utilisation
 
-La barre du haut propose deux modes : **Bibliothèque iPhoto** et **Explorer un dossier**,
+La barre du haut propose trois sources : **Bibliothèque iPhoto**, **Explorer un dossier** et
+**Collections** (albums virtuels),
 les boutons *Ouvrir une bibliothèque…* et *Ouvrir un dossier…*, et le champ de recherche.
 Quand la fenêtre est étroite, ces boutons n'affichent plus que leur icône (une info-bulle
 rappelle leur rôle). Le titre de la vue et la pagination se trouvent au-dessus de la grille.
@@ -354,3 +374,14 @@ Le contrôle porte sur :
 
 Il affiche aussi les noms partagés par plusieurs albums, pour vérifier que chacun garde son
 propre contenu. Le code de sortie vaut 0 si tout est cohérent, 1 sinon.
+
+## 11. Tests
+
+```bash
+./tests/run_tests.sh
+```
+
+Compilation, tests unitaires du paquet `iphotorlib`, non-régression des fonctions 1.x, parcours
+utilisateurs de la version 2 et contrôle de cohérence. Les tests travaillent dans un dossier
+temporaire, sur une photothèque de démonstration générée : les données réelles ne sont jamais
+touchées. Résultats et performances mesurées : [docs/rapport-tests.md](docs/rapport-tests.md).

@@ -15,6 +15,9 @@ La version 1.4 ajoute la copie (presse-papiers, dossier de destination), les fav
 tags et l'affichage des informations EXIF. La version 1.5 modernise toute l'interface
 (design system, icônes, thème clair et sombre) sans changer le comportement : voir
 `docs/rapport-modernisation-design.md`.
+La version 2.0 ajoute l'exploration et l'analyse : sélection multiple, recherche avancée,
+chronologie, albums virtuels et intelligents, doublons, comparaison, statistiques, carte hors
+ligne, diaporama, export. Voir `docs/architecture-v2.md` et `docs/rapport-final-v2.md`.
 
 ## 2. Contraintes non négociables
 
@@ -30,15 +33,23 @@ tags et l'affichage des informations EXIF. La version 1.5 modernise toute l'inte
    Les copies (`CopyTask`) lisent les sources et refusent toute destination située dans une
    bibliothèque ou un dossier consulté ; elles ne remplacent jamais un fichier existant.
    Les favoris et les tags ne sont jamais écrits dans les photos ni dans la bibliothèque.
+   En 2.0, toute nouvelle écriture (index des métadonnées, collections, exports, instantanés,
+   résultats de doublons) passe par `storage.assert_outside()`. Les bases Apple lues par
+   `applemeta` sont copiées dans le cache (`storage.SourceDBCopy`). Aucune suppression de photo
+   n'est jamais proposée, même pour les doublons.
 2. **Caches hors bibliothèque :** `~/.cache/photoexplorer_iphoto/bibliotheques/<nom>-<empreinte>/`,
    un dossier par bibliothèque, et `…/dossiers/thumbs/` pour les dossiers explorés. Si le
    dossier exploré contient le cache, les vignettes ne sont pas enregistrées. Les préférences
    sont dans `~/.config/iphotor/config.json`. Les favoris et les tags, qui sont des données de
-   l'utilisateur et non un cache, sont dans `~/.local/share/iphotor/annotations.sqlite3`.
+   l'utilisateur et non un cache, sont dans `~/.local/share/iphotor/annotations.sqlite3` ; les
+   albums virtuels, albums intelligents et recherches enregistrées dans `collections.sqlite3`
+   (même dossier, schéma versionné, sauvegarde `*.bak-v<N>` avant migration). L'index des
+   métadonnées (`metadata.sqlite3`) est un cache, dans le dossier de la bibliothèque.
 3. **Pile technique :** Python 3, Tkinter/ttk, Pillow, plistlib, sqlite3. GdkPixbuf est
    facultatif, pour le HEIC et le presse-papiers. Aucun serveur et aucune connexion réseau
    (seul le bouton « Voir sur une carte » ouvre OpenStreetMap dans le navigateur, à la demande).
-4. **Un seul fichier** (`iphotor.py`) pour simplifier l'installation, mais organisé en classes.
+4. **Fichiers :** `iphotor.py` (existant et interface) et le paquet `iphotorlib/` (logique des
+   fonctions 2.0, sans Tkinter, testable seul ; installé dans `/usr/share/iphotor/`).
 5. **Interface et messages en français.**
 6. **Robustesse :** une photo manquante ou illisible ne doit jamais arrêter l'application.
 7. **Confidentialité :** le dépôt ne contient aucune donnée personnelle. Pas de nom de
@@ -182,8 +193,23 @@ iphotor.py
 ├── TagDialog, ExifDialog, CopyDialog, CopyProgress   fenêtres des nouvelles actions
 ├── MainWindow       arborescence + grille sur un Canvas + recherche + pagination + changement de bibliothèque
 │                    + barre des modes (set_mode sauvegarde et restaure l'état de chaque mode)
+├── CollectionBrowser, CollectionLibrary   source « Collections » (albums virtuels), sur le modèle du mode dossier
+├── TaskDialog, AdvancedSearchDialog, ExportDialog, StatsWindow, DuplicatesWindow, CompareWindow,
+│   GeoWindow, SlideshowWindow, InfoDialog   fenêtres de la version 2
 └── verify()         contrôle de cohérence en ligne de commande (--verifier)
+
+iphotorlib/          logique de la version 2 (aucune dépendance à Tkinter)
+├── storage          emplacements, garde-fou d'écriture, copie des bases sources, migrations
+├── metadata         index des métadonnées incrémental (EXIF, dimensions, GPS, empreintes)
+├── search           critères multicritère → SQL (index + metadata attachée ; table mémoire en mode dossier)
+├── timeline         agrégation année / mois / jour
+├── collections      albums virtuels, intelligents, recherches enregistrées
+├── duplicates       SHA-256, pHash, regroupement multi-index + fenêtre temporelle
+├── stats, export, geo, folders, applemeta, deps
 ```
+
+Tests : `tests/run_tests.sh` (unitaires `test_lib.py`, non-régression `regression_gui.py`,
+parcours `test_gui_v2.py`, mesures `perf.py` / `perf_gui.py`, données générées par `fixtures.py`).
 
 ### Règles de conception
 
@@ -240,17 +266,12 @@ iphotor.py
 
 ## 8. Pistes pour les versions suivantes
 
-- Lire `Database/` (bases SQLite d'iPhoto, en `mode=ro&immutable=1`) : visages, mots-clés,
-  lieux, critères des albums intelligents.
-- Exploiter `latitude` / `longitude`, par exemple avec une carte.
-- Exploiter `List of Faces` et le champ `Faces` des photos.
-- Photos : visages (`RKPerson`, `RKFace`), mots-clés (`RKKeyword`), lieux (`RKPlace`).
-- Prendre en charge les bibliothèques Photos 5 et suivantes (`Photos.sqlite`).
-- Lire les vidéos (lecteur externe ou intégré).
-- Décoder directement les RAW (par exemple avec `rawpy`) quand il n'y a pas d'aperçu intégré.
-- Sélection multiple dans la grille (favoris, tags et copie de plusieurs photos à la fois).
-- Importer les mots-clés et les favoris d'iPhoto / Photos comme tags iphotor (lecture seule).
-- Prévoir un mode de recherche avancé : par date, par note, recherche combinée.
-- Mode dossier : HEIC et RAW (déjà décodés pour les bibliothèques), dossiers récents,
-  surveillance des changements du dossier.
-- Tester le comportement avec le disque débranché, qui n'a pas encore été vérifié en conditions réelles.
+- Valider l'import des mots-clés, personnes et lieux Apple (`applemeta`) sur des bibliothèques
+  réelles de chaque génération (testé seulement sur des bases synthétiques).
+- Prendre en charge les bibliothèques Photos 5 et suivantes (`Photos.sqlite`) : couche d'accès
+  par introspection des tables Core Data, à valider sur des bibliothèques réelles.
+- Lecture vidéo intégrée (aujourd'hui : lecteur système).
+- Critères des albums intelligents d'iPhoto (bases `Database/`).
+- Géocodage hors ligne des coordonnées GPS (nécessiterait un jeu de données local).
+- Indexation incrémentale de l'index des photos lui-même.
+- Tester la déconnexion d'un disque en conditions réelles (simulée par renommage dans les tests).

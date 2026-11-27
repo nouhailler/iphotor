@@ -4,7 +4,7 @@
 iphotor — Explorateur en lecture seule d'une ancienne bibliothèque iPhoto ou Photos (1 à 4),
 et de n'importe quel dossier d'images (mode « Explorer un dossier »).
 
-Version 1.5
+Version 2.0
 
 Principe fondamental : la bibliothèque iPhoto et les dossiers consultés ne sont JAMAIS modifiés.
   * Tous les fichiers de la bibliothèque sont ouverts en lecture seule ("rb").
@@ -71,13 +71,41 @@ try:
 except ImportError:  # pragma: no cover
     ImageTk = None  # type: ignore
 
+# Facultatifs : HEIC via Pillow (pillow-heif) et développement des RAW (rawpy).
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    PILLOW_HEIF = True
+except Exception:
+    PILLOW_HEIF = False
+try:
+    import rawpy  # type: ignore
+except Exception:
+    rawpy = None  # type: ignore
+
+# Logique des fonctionnalités d'iphotor 2 (paquet iphotorlib, sans interface graphique),
+# cherché à côté du script puis dans /usr/share/iphotor (paquet Debian).
+_here = os.path.dirname(os.path.realpath(__file__))
+for _dir in (_here, os.path.normpath(os.path.join(_here, "..", "share", "iphotor")), "/usr/share/iphotor"):
+    if os.path.isdir(os.path.join(_dir, "iphotorlib")) and _dir not in sys.path:
+        sys.path.insert(0, _dir)
+        break
+try:
+    from iphotorlib import (applemeta, collections as vcoll, deps as depcheck, duplicates as dupes,  # noqa: E402
+                            export as mexport, folders as folderlib, geo, metadata as mdlib,
+                            search as advsearch, stats as statlib, storage, timeline as tl)
+except ImportError as _exc:  # installation incomplète : message clair plutôt qu'une trace Python
+    sys.stderr.write("iphotor : le dossier « iphotorlib » est introuvable (il doit se trouver à côté de "
+                     f"iphotor.py ou dans /usr/share/iphotor).\nDétail : {_exc}\n")
+    sys.exit(3)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 APP_NAME = "iphotor"
-APP_VERSION = "1.5.0"
+APP_VERSION = "2.0.0"
 
 # Emplacement par défaut (nom standard sous macOS) ; sinon, choisir via « Ouvrir une bibliothèque ».
 DEFAULT_LIBRARY = os.path.expanduser("~/Pictures/iPhoto Library")
@@ -121,6 +149,7 @@ KIND_ALL = "all"
 # Modes de l'interface
 MODE_LIBRARY = "library"   # bibliothèque iPhoto / Photos
 MODE_FOLDER = "folder"     # dossier indépendant
+MODE_COLLECTIONS = "collections"   # albums virtuels (références multi-sources)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +257,7 @@ class Photo:
     size: int = 0          # taille du fichier (mode « Explorer un dossier »)
     folder: str = ""       # sous-dossier relatif au dossier ouvert ("" = le dossier lui-même)
     source: str = ""       # "folder" pour une image d'un dossier indépendant
+    ref: Optional[tuple] = None   # albums virtuels : (portée, clé) de la photo d'origine
 
     @property
     def is_video(self) -> bool:
@@ -1141,6 +1171,13 @@ class Settings:
         self.copy_original: bool = False
         self.copy_open: bool = False
         self.theme: str = "light"
+        self.recent_folders: list[str] = []
+        self.folder_favorites: list[str] = []
+        self.folder_watch: bool = False
+        self.slideshow_interval: int = 4
+        self.slideshow_loop: bool = True
+        self.slideshow_info: bool = True
+        self.slideshow_order: str = "chrono"
         self.load()
 
     def load(self) -> None:
@@ -1160,6 +1197,16 @@ class Settings:
             self.copy_open = bool(data.get("copy_open", False))
             theme = _as_str(data.get("theme"))
             self.theme = theme if theme in ("light", "dark") else "light"
+            self.recent_folders = [_as_str(p) for p in data.get("recent_folders", []) if p][:12]
+            self.folder_favorites = [_as_str(p) for p in data.get("folder_favorites", []) if p]
+            self.folder_watch = bool(data.get("folder_watch", False))
+            try:
+                self.slideshow_interval = max(1, min(60, int(data.get("slideshow_interval", 4))))
+            except (TypeError, ValueError):
+                self.slideshow_interval = 4
+            self.slideshow_loop = bool(data.get("slideshow_loop", True))
+            self.slideshow_info = bool(data.get("slideshow_info", True))
+            self.slideshow_order = _as_str(data.get("slideshow_order")) or "chrono"
 
     def save(self) -> None:
         try:
@@ -1170,7 +1217,10 @@ class Settings:
                            "last_folder": self.last_folder, "folder_recursive": self.folder_recursive,
                            "folder_sort": self.folder_sort, "copy_dest": self.copy_dest,
                            "copy_original": self.copy_original, "copy_open": self.copy_open,
-                           "theme": self.theme},
+                           "theme": self.theme, "recent_folders": self.recent_folders,
+                           "folder_favorites": self.folder_favorites, "folder_watch": self.folder_watch,
+                           "slideshow_interval": self.slideshow_interval, "slideshow_loop": self.slideshow_loop,
+                           "slideshow_info": self.slideshow_info, "slideshow_order": self.slideshow_order},
                           fh, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
         except OSError as exc:
@@ -1390,6 +1440,11 @@ class View:
     query: str = ""
     title: str = ""
     keys: tuple = ()              # "keys" : favoris ou tag (GUID, ou « id:N »)
+    ids: tuple = ()               # "ids" : résultat d'une recherche avancée, groupe de doublons…
+    start: Optional[float] = None # "date" : intervalle [start, end[ (secondes Apple)
+    end: Optional[float] = None
+    level: str = ""               # "timeline" : years | months | days
+    month: Optional[int] = None
 
 
 class PhotoManager:
@@ -1433,6 +1488,12 @@ class PhotoManager:
                         "ORDER BY ap.position", [view.album_id, q])
             return (f"SELECT {select} FROM photos p "
                     "WHERE p.search LIKE ? ESCAPE '\\' ORDER BY p.date, p.id", [q])
+        if view.kind == "ids":
+            return (f"SELECT {select} FROM photos p WHERE p.id IN (SELECT value FROM json_each(?)) "
+                    "ORDER BY p.date, p.id", [json.dumps(list(view.ids))])
+        if view.kind == "date":
+            return (f"SELECT {select} FROM photos p WHERE p.date >= ? AND p.date < ? ORDER BY p.date, p.id",
+                    [view.start, view.end])
         if view.kind == "keys":
             keys = json.dumps(list(view.keys))
             return (f"SELECT {select} FROM photos p "
@@ -1622,22 +1683,36 @@ def _apply_orientation(img, orientation: int):
     return img
 
 
+def _load_rawpy(path: str, max_w: int, max_h: int):
+    """Développement d'un RAW sans aperçu intégré (module facultatif rawpy, lecture seule)."""
+    with rawpy.imread(path) as raw:
+        rgb = raw.postprocess(half_size=True, use_camera_wb=True, no_auto_bright=False, output_bps=8)
+    img = Image.fromarray(rgb)
+    img.thumbnail((max_w, max_h))
+    return img
+
+
 def load_pil_image(path: str, max_w: int, max_h: int):
     """Ouvre une image en lecture seule et la réduit (sans déformation).
 
     Gère aussi le HEIC (via GdkPixbuf) et les RAW TIFF (aperçu JPEG intégré).
     """
     ext = file_ext(path)
-    if ext in HEIF_EXTS:
-        if not heif_supported():
-            raise ValueError("format HEIC non pris en charge (paquet heif-gdk-pixbuf absent)")
+    if ext in HEIF_EXTS and heif_supported():
         img = _load_heif(path, max_w, max_h)
+    elif ext in HEIF_EXTS and not PILLOW_HEIF:
+        raise ValueError("format HEIC non pris en charge : installez heif-gdk-pixbuf (ou python3-pillow-heif)")
     else:
         raw_orientation = None
+        data = None
         if ext in RAW_TIFF_EXTS:
             data, raw_orientation = extract_raw_preview(path)
-            if data is None:
-                raise ValueError("aucun aperçu JPEG intégré dans ce fichier RAW")
+        if ext in RAW_EXTS and data is None:
+            if rawpy is None:
+                raise ValueError("aucun aperçu JPEG intégré dans ce fichier RAW "
+                                 "(installez le module facultatif rawpy pour le développer)")
+            return _load_rawpy(path, max_w, max_h)
+        if data is not None:
             fh = io.BytesIO(data)
         else:
             with open(path, "rb") as f:
@@ -1729,7 +1804,10 @@ class ThumbnailLoader:
 # Exploration de dossiers indépendants (lecture seule)
 # ---------------------------------------------------------------------------
 
-FOLDER_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff"}
+FOLDER_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff",
+                     # 2.0 : RAW (aperçu intégré, ou rawpy) et HEIC (GdkPixbuf ou pillow-heif) ;
+                     # un format non décodable est signalé sur sa vignette.
+                     ".cr2", ".nef", ".arw", ".dng", ".pef", ".srw", ".heic", ".heif"}
 FOLDER_CACHE_DIR = os.path.join(CACHE_DIR, "dossiers")
 
 # (libellé, clé, ordre décroissant)
@@ -1872,6 +1950,7 @@ class FolderBrowser:
         self.subdir: Optional[str] = None
         self.only: Optional[set[str]] = None     # favoris / tag : clés des images à garder
         self.only_title = ""
+        self.date_range: Optional[tuple[float, float]] = None   # chronologie (secondes Apple)
         self.order: list[int] = []
 
     def load(self, scanner: FolderScanner) -> None:
@@ -1892,6 +1971,7 @@ class FolderBrowser:
         self.query = ""
         self.subdir = None
         self.only = None
+        self.date_range = None
         self.refresh()
 
     def set_sort(self, key: str, desc: bool) -> None:
@@ -1908,6 +1988,9 @@ class FolderBrowser:
         if self.only is not None:
             only = self.only
             idx = [i for i in idx if path_key(self.photos[i].image_path) in only]
+        if self.date_range is not None:
+            a, b = self.date_range
+            idx = [i for i in idx if self.photos[i].date is not None and a <= self.photos[i].date < b]
         q = normalize_text(self.query.strip())
         if q:
             idx = [i for i in idx if q in normalize_text(self.photos[i].filename)]
@@ -1918,6 +2001,8 @@ class FolderBrowser:
             key = lambda i: ph[i].size
         else:
             key = lambda i: natural_key(f"{ph[i].folder}/{ph[i].filename}" if ph[i].folder else ph[i].filename)
+        if self.sort_key == "position":
+            key = lambda i: i
         self.order = sorted(idx, key=key, reverse=self.sort_desc)
 
     # -- interface commune avec PhotoManager -----------------------------------
@@ -1965,6 +2050,55 @@ class FolderLibrary:
         """Garde-fou : refuse toute écriture dans le dossier consulté."""
         if self.root and is_inside(path, self.root):
             raise PermissionError(f"Écriture refusée : {path} se trouve dans le dossier consulté.")
+
+
+class CollectionBrowser(FolderBrowser):
+    """Contenu d'un album virtuel : références vers des fichiers de plusieurs sources (ordre de l'album)."""
+
+    def load_items(self, items: list) -> None:
+        self.root = ""
+        self.photos = []
+        self.missing = 0
+        for i, it in enumerate(items):
+            try:
+                st = os.stat(it.path)
+                size, mtime = st.st_size, st.st_mtime
+            except (OSError, ValueError):
+                size, mtime = it.size, 0.0
+                self.missing += 1
+            self.photos.append(Photo(
+                id=i, guid="", caption="", comment="", rating=0, roll_id=None, media_type="Image",
+                image_path=it.path, original_path="", thumb_path="", date=it.date, mod_date=mtime,
+                filename=it.filename or os.path.basename(it.path), size=size, folder="", source="folder",
+                ref=(it.scope, it.key)))
+        self.dir_counts = {}
+        self.query = ""
+        self.subdir = None
+        self.only = None
+        self.date_range = None
+        self.sort_key, self.sort_desc = "position", False
+        self.refresh()
+
+
+class CollectionLibrary(FolderLibrary):
+    """Équivalent de FolderLibrary pour les albums virtuels : chemins absolus, sources protégées."""
+
+    def __init__(self, protected: Callable[[], list]):
+        super().__init__("")
+        self._protected = protected
+        self._dirs: set[str] = set()
+
+    def set_items(self, items: list) -> None:
+        self._dirs = {os.path.dirname(i.path) for i in items if i.path}
+
+    def is_available(self) -> bool:
+        return True
+
+    def unavailable_message(self) -> str:
+        return "Certaines photos de cet album sont introuvables (disque débranché ou fichier déplacé)."
+
+    def assert_outside(self, path: str) -> None:
+        storage.assert_outside(path, list(self._protected()) + sorted(self._dirs))
 
 
 class FolderThumbCache:
@@ -3487,6 +3621,7 @@ class PhotoViewer:
         self.win.title(f"{p.filename or p.label} — iphotor")
         self.info_title.config(text=p.caption or p.filename)
         self.refresh_annotations()
+        terms = self.app.apple_terms_text(p)
         if p.source == "folder":
             details = [f"Dossier : {p.folder or '.'}"]
             if p.date is not None:
@@ -3508,7 +3643,10 @@ class PhotoViewer:
         self._details = "   ·   ".join(details)
         self.info_details.config(text=self._details)
         comment = p.comment if p.comment and p.comment != p.caption else ""
-        self.info_comment.config(text=f"Commentaire : {comment}" if comment else "")
+        text = f"Commentaire : {comment}" if comment else ""
+        if terms:
+            text = f"{text}   ·   {terms}" if text else terms
+        self.info_comment.config(text=text)
 
     def _message(self, text: str, color: Optional[str] = None, error: bool = False) -> None:
         self.canvas.delete("all")
@@ -4141,6 +4279,1475 @@ class CopyProgress:
                 pass
 
 
+class TaskDialog:
+    """Progression d'une opération longue exécutée dans un thread (non modale, annulable).
+
+    work(task) s'exécute dans un thread ; il met à jour task.done / task.total / task.text et
+    surveille task.cancel. done(result, error) est appelée dans le thread Tk à la fin.
+    """
+
+    def __init__(self, app: "MainWindow", parent, title: str, heading: str, work: Callable, done: Callable,
+                 icon: str = "refresh", cancellable: bool = True):
+        self.app = app
+        self.cancel = threading.Event()
+        self.done_cb = done
+        self.total = 0
+        self.done = 0
+        self.text = "Préparation…"
+        self._result: list = []
+        self.win = tk.Toplevel(parent)
+        self.win.title(f"{title} — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.protocol("WM_DELETE_WINDOW", self.request_cancel)
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, 0))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get(icon, 28, "accent"), style="Panel.TLabel").pack(side="left", padx=(0, SPACE_M))
+        ttk.Label(head, text=heading, style="Title.TLabel", wraplength=420, justify="left").pack(side="left", anchor="w")
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        body = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L))
+        body.pack(fill="both", expand=True)
+        self.bar = ttk.Progressbar(body, mode="indeterminate", length=440)
+        self.bar.pack(fill="x")
+        self.bar.start(12)
+        self.label = ttk.Label(body, text=self.text, style="Muted.TLabel", wraplength=440, justify="left")
+        self.label.pack(anchor="w", pady=(SPACE_S, 0))
+        self.btn = ttk.Button(foot, text="Annuler", command=self.request_cancel)
+        if cancellable:
+            self.btn.pack(side="right")
+
+        def runner():
+            try:
+                self._result.append((work(self), None))
+            except Exception as exc:
+                traceback.print_exc()
+                self._result.append((None, exc))
+        threading.Thread(target=runner, daemon=True, name="tache").start()
+        self.win.after(120, self._poll)
+
+    def request_cancel(self) -> None:
+        self.cancel.set()
+        self.btn.state(["disabled"])
+        self.label.config(text="Annulation…")
+
+    def _poll(self) -> None:
+        if not self.win.winfo_exists():
+            return
+        if self._result:
+            result, error = self._result[0]
+            self.win.destroy()
+            self.done_cb(result, error)
+            return
+        if self.total and str(self.bar.cget("mode")) != "determinate":
+            self.bar.stop()
+            self.bar.configure(mode="determinate")
+        if self.total:
+            self.bar.configure(maximum=max(1, self.total), value=self.done)
+        if not self.cancel.is_set():
+            self.label.config(text=self.text)
+        self.win.after(120, self._poll)
+
+
+class TextDialog(_Dialog):
+    """Saisie d'un texte (nom d'album, de recherche…)."""
+
+    def __init__(self, app, parent, title: str, heading: str, label: str, initial: str = "", icon: str = "album",
+                 ok_text: str = "Valider"):
+        super().__init__(app, parent, f"{title} — iphotor", heading, icon=icon)
+        self.result: Optional[str] = None
+        ttk.Label(self.body, text=label.upper(), style="Section.TLabel").pack(anchor="w")
+        self.var = tk.StringVar(value=initial)
+        e = ttk.Entry(self.body, textvariable=self.var, width=44)
+        e.pack(fill="x", pady=(SPACE_XS, 0))
+        e.select_range(0, "end")
+        self.buttons(ok_text, self.ok)
+        self.win.bind("<Return>", lambda ev: self.ok())
+        self.win.bind("<Escape>", lambda ev: self.win.destroy())
+        self._grab()
+        e.focus_set()
+        self.win.wait_window()
+
+    def ok(self) -> None:
+        v = self.var.get().strip()
+        if not v:
+            messagebox.showwarning("Nom vide", "Saisissez un nom.", parent=self.win)
+            return
+        self.result = v
+        self.win.destroy()
+
+
+class AlbumChooserDialog(_Dialog):
+    """Choix d'un album virtuel existant, ou création d'un nouvel album."""
+
+    def __init__(self, app, parent, count: int):
+        super().__init__(app, parent, "Ajouter à un album virtuel — iphotor", "Ajouter à un album virtuel",
+                         f"{plural(count, 'photo')} : seules des références sont enregistrées, les fichiers ne "
+                         "bougent pas.", icon="album")
+        self.result: Optional[int] = None
+        self.albums = app.collections.albums("manual")
+        ttk.Label(self.body, text="ALBUM", style="Section.TLabel").pack(anchor="w")
+        self.var = tk.StringVar(value="__new__" if not self.albums else str(self.albums[0].id))
+        box = ttk.Frame(self.body, style="Panel.TFrame")
+        box.pack(fill="x", pady=(SPACE_XS, SPACE_S))
+        for a in self.albums[:14]:
+            ttk.Radiobutton(box, text=f"{a.name}  ({plural(a.count, 'photo')})", value=str(a.id),
+                            variable=self.var).pack(anchor="w")
+        row = ttk.Frame(box, style="Panel.TFrame")
+        row.pack(anchor="w", fill="x")
+        ttk.Radiobutton(row, text="Nouvel album :", value="__new__", variable=self.var).pack(side="left")
+        self.name = tk.StringVar(value="")
+        e = ttk.Entry(row, textvariable=self.name, width=28)
+        e.pack(side="left", padx=(SPACE_S, 0), fill="x", expand=True)
+        e.bind("<FocusIn>", lambda ev: self.var.set("__new__"))
+        self.buttons("Ajouter", self.ok)
+        self.win.bind("<Return>", lambda ev: self.ok())
+        self.win.bind("<Escape>", lambda ev: self.win.destroy())
+        self._grab()
+        if not self.albums:
+            e.focus_set()
+        self.win.wait_window()
+
+    def ok(self) -> None:
+        if self.var.get() == "__new__":
+            name = self.name.get().strip()
+            if not name:
+                messagebox.showwarning("Nom vide", "Saisissez le nom du nouvel album.", parent=self.win)
+                return
+            try:
+                self.result = self.app.collections.create(name)
+            except (sqlite3.Error, ValueError, OSError, RuntimeError) as exc:
+                messagebox.showerror("Album virtuel", str(exc), parent=self.win)
+                return
+        else:
+            self.result = int(self.var.get())
+        self.win.destroy()
+
+
+class InfoDialog:
+    """Fiche d'informations (clé / valeur), non modale, avec copie du texte."""
+
+    def __init__(self, app, parent, title: str, heading: str, subtitle: str, rows: list, icon: str = "info"):
+        self.app = app
+        self.rows = rows
+        self.win = tk.Toplevel(parent)
+        self.win.title(f"{title} — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.geometry("640x520")
+        self.win.minsize(420, 300)
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_M))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get(icon, 28, "accent"), style="Panel.TLabel").pack(side="left", padx=(0, SPACE_M), anchor="n")
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text=heading, style="Title.TLabel").pack(anchor="w")
+        if subtitle:
+            ttk.Label(txt, text=subtitle, style="Muted.TLabel", wraplength=520, justify="left").pack(anchor="w")
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        ttk.Button(foot, text="Fermer", style="Accent.TButton", command=self.win.destroy).pack(side="right")
+        ttk.Button(foot, text="Copier le texte", image=app.icons.get("copy", 16), compound="left",
+                   command=self.copy).pack(side="right", padx=(0, SPACE_S))
+        frame = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_L, 0, SPACE_L, SPACE_S))
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(frame, columns=("v",), show="tree", style="Item.Treeview")
+        self.tree.column("#0", width=230, stretch=False)
+        self.tree.column("v", width=360, stretch=True)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("section", font=app.font_bold, foreground=COLORS["text"])
+        self.tree.tag_configure("warn", foreground=COLORS["missing"])
+        parent_iid = ""
+        for row in rows:
+            if row[0] == "#":
+                parent_iid = self.tree.insert("", "end", text=row[1], tags=("section",), open=True)
+            else:
+                tags = ("warn",) if len(row) > 2 and row[2] == "warn" else ()
+                self.tree.insert(parent_iid, "end", text=row[0], values=(row[1],), tags=tags)
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+
+    def copy(self) -> None:
+        lines = []
+        for row in self.rows:
+            lines.append(f"\n[{row[1]}]" if row[0] == "#" else f"{row[0]} : {row[1]}")
+        self.win.clipboard_clear()
+        self.win.clipboard_append("\n".join(lines).strip())
+        self.app._set_status("Informations copiées dans le presse-papiers.")
+
+
+class AdvancedSearchDialog:
+    """Recherche avancée multicritère (fenêtre non modale, une seule instance)."""
+
+    def __init__(self, app: "MainWindow", criteria: Optional[dict] = None, smart_id: Optional[int] = None):
+        self.app = app
+        self.smart_id = smart_id
+        self.dialect = app.search_dialect()
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Recherche avancée — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.geometry("900x560")
+        self.win.minsize(720, 380)
+        self.win.transient(app.root)
+        self.rows: list[dict] = []
+        self.fields = [f for f in advsearch.FIELDS if f.expr(self.dialect) is not None]
+        self.unavailable = [f for f in advsearch.FIELDS if f.expr(self.dialect) is None]
+        self.labels = [f"{f.group} · {f.label}" for f in self.fields]
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_S))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get("search", 28, "accent"), style="Panel.TLabel").pack(side="left", padx=(0, SPACE_M), anchor="n")
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text="Modifier l'album intelligent" if smart_id else "Recherche avancée",
+                  style="Title.TLabel").pack(anchor="w")
+        self.coverage = ttk.Label(txt, text="", style="Muted.TLabel", wraplength=640, justify="left")
+        self.coverage.pack(anchor="w")
+        self.btn_analyze = ttk.Button(head, text="Analyser les métadonnées…", image=app.icons.get("refresh", 16),
+                                      compound="left", command=self._analyze)
+        self.btn_analyze.pack(side="right", anchor="n")
+        # combinaison
+        mrow = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, 0, SPACE_XL, SPACE_S))
+        mrow.pack(fill="x")
+        ttk.Label(mrow, text="Afficher les photos qui remplissent", style="Panel.TLabel").pack(side="left")
+        self.match = tk.StringVar(value="all")
+        ttk.Radiobutton(mrow, text="tous les critères (ET)", value="all", variable=self.match).pack(side="left", padx=(SPACE_M, 0))
+        ttk.Radiobutton(mrow, text="au moins un critère (OU)", value="any", variable=self.match).pack(side="left", padx=(SPACE_M, 0))
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        self.result_label = ttk.Label(foot, text="", style="Footer.TLabel")
+        self.result_label.pack(side="left")
+        ttk.Button(foot, text="Rechercher" if not smart_id else "Enregistrer", style="Accent.TButton",
+                   command=self.apply if not smart_id else self.save_smart).pack(side="right")
+        ttk.Button(foot, text="Fermer", command=self.win.destroy).pack(side="right", padx=(0, SPACE_S))
+        if not smart_id:
+            mb = ttk.Menubutton(foot, text="Enregistrer…", style="TButton")
+            m = tk.Menu(mb, tearoff=False)
+            m.add_command(label="Enregistrer comme recherche…", command=self.save_search)
+            m.add_command(label="Créer un album intelligent…", command=self.create_smart)
+            mb["menu"] = m
+            mb.pack(side="right", padx=(0, SPACE_S))
+            self.saved_mb = ttk.Menubutton(foot, text="Recherches enregistrées", style="TButton")
+            self.saved_menu = tk.Menu(self.saved_mb, tearoff=False, postcommand=self._fill_saved)
+            self.saved_mb["menu"] = self.saved_menu
+            self.saved_mb.pack(side="right", padx=(0, SPACE_S))
+        ttk.Button(foot, text="Réinitialiser", command=self.reset).pack(side="right", padx=(0, SPACE_S))
+        # critères (zone défilante)
+        outer = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, 0, SPACE_L, SPACE_S))
+        outer.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(outer, bg=COLORS["panel"], highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.inner = ttk.Frame(self.canvas, style="Panel.TFrame")
+        self._inner_id = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._inner_id, width=e.width))
+        self.add_btn = ttk.Button(self.inner, text="Ajouter un critère", image=app.icons.get("search", 16),
+                                  compound="left", style="Ghost.TButton", command=lambda: self.add_rule())
+        if self.unavailable:
+            names = ", ".join(f.label.lower() for f in self.unavailable)
+            self.na_label = ttk.Label(self.inner, text=f"Non disponibles pour cette source : {names}.",
+                                      style="Small.TLabel", wraplength=780, justify="left")
+        else:
+            self.na_label = None
+        self.load(criteria or app.adv_criteria or {"match": "all", "rules": [{"field": "filename", "op": "contains", "value": ""}]})
+        self.refresh_coverage()
+        self.win.bind("<Return>", lambda e: self.apply() if not smart_id else self.save_smart())
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+
+    # -- critères ------------------------------------------------------------------
+    def load(self, criteria: dict) -> None:
+        for r in list(self.rows):
+            r["frame"].destroy()
+        self.rows = []
+        self.match.set(criteria.get("match", "all"))
+        for rule in criteria.get("rules", []) or [{}]:
+            self.add_rule(rule)
+
+    def add_rule(self, rule: Optional[dict] = None) -> None:
+        rule = rule or {}
+        fr = ttk.Frame(self.inner, style="Panel.TFrame")
+        fr.pack(fill="x", pady=3, before=self.add_btn if self.add_btn.winfo_ismapped() else None)
+        r = {"frame": fr, "field": tk.StringVar(), "op": tk.StringVar(), "value": tk.StringVar(),
+             "value2": tk.StringVar()}
+        fbox = ttk.Combobox(fr, textvariable=r["field"], values=self.labels, state="readonly", width=28)
+        fbox.pack(side="left")
+        obox = ttk.Combobox(fr, textvariable=r["op"], state="readonly", width=14)
+        obox.pack(side="left", padx=(SPACE_S, 0))
+        val = ttk.Combobox(fr, textvariable=r["value"], width=14)
+        val.pack(side="left", padx=(SPACE_S, 0), fill="x", expand=True)
+        and_lbl = ttk.Label(fr, text="et", style="Muted.TLabel")
+        val2 = ttk.Entry(fr, textvariable=r["value2"], width=12)
+        unit = ttk.Label(fr, text="", style="Muted.TLabel")
+        rm = ttk.Button(fr, image=self.app.icons.get("close", 14, "muted"), style="Icon.TButton",
+                        command=lambda: self._remove(r))
+        rm.pack(side="right", padx=(SPACE_S, 0))
+        Tooltip(rm, "Retirer ce critère")
+        r.update(fbox=fbox, obox=obox, val=val, val2=val2, and_lbl=and_lbl, unit=unit)
+        self.rows.append(r)
+        name = rule.get("field") or "filename"
+        f = advsearch.FIELD_BY_NAME.get(name)
+        if f not in self.fields:
+            f = self.fields[0]
+        r["field"].set(self.labels[self.fields.index(f)])
+        self._field_changed(r, rule.get("op"))
+        if rule.get("value") is not None:
+            v = rule["value"]
+            if f.type == "choice":
+                v = dict(f.choices).get(v, v)
+            r["value"].set(str(v))
+        if rule.get("value2") is not None:
+            r["value2"].set(str(rule["value2"]))
+        fbox.bind("<<ComboboxSelected>>", lambda e: (fbox.selection_clear(), self._field_changed(r)))
+        obox.bind("<<ComboboxSelected>>", lambda e: (obox.selection_clear(), self._op_changed(r)))
+        val.bind("<<ComboboxSelected>>", lambda e: val.selection_clear())
+        self.add_btn.pack_forget()
+        self.add_btn.pack(anchor="w", pady=(SPACE_S, 0))
+        if self.na_label is not None:
+            self.na_label.pack_forget()
+            self.na_label.pack(anchor="w", pady=(SPACE_M, 0))
+
+    def _remove(self, r: dict) -> None:
+        r["frame"].destroy()
+        self.rows.remove(r)
+
+    def _field(self, r: dict) -> "advsearch.Field":
+        lbl = r["field"].get()
+        return self.fields[self.labels.index(lbl)] if lbl in self.labels else self.fields[0]
+
+    def _field_changed(self, r: dict, op: Optional[str] = None) -> None:
+        f = self._field(r)
+        ops = advsearch.OPS[f.type]
+        r["obox"].configure(values=[lbl for _o, lbl in ops])
+        code = op if op in dict(ops) else ops[0][0]
+        r["op"].set(dict(ops)[code])
+        if f.type == "choice":
+            r["val"].configure(values=[lbl for _v, lbl in f.choices], state="readonly")
+            r["value"].set(f.choices[0][1])
+        elif f.type == "tag":
+            r["val"].configure(values=self.app.known_tags(), state="normal")
+            r["value"].set("")
+        else:
+            r["val"].configure(values=(), state="normal")
+            r["value"].set("")
+        r["unit"].configure(text=f.unit)
+        self._op_changed(r)
+
+    def _op_code(self, r: dict) -> str:
+        f = self._field(r)
+        return next((o for o, lbl in advsearch.OPS[f.type] if lbl == r["op"].get()), advsearch.OPS[f.type][0][0])
+
+    def _op_changed(self, r: dict) -> None:
+        code = self._op_code(r)
+        f = self._field(r)
+        for w in (r["and_lbl"], r["val2"], r["unit"]):
+            w.pack_forget()
+        if code in advsearch.NO_VALUE_OPS:
+            r["val"].pack_forget()
+            return
+        if not r["val"].winfo_ismapped():
+            r["val"].pack(side="left", padx=(SPACE_S, 0), fill="x", expand=True, after=r["obox"])
+        last = r["val"]
+        if code == "between":
+            r["and_lbl"].pack(side="left", padx=(SPACE_S, 0), after=r["val"])
+            r["val2"].pack(side="left", padx=(SPACE_S, 0), after=r["and_lbl"])
+            last = r["val2"]
+        if f.unit:
+            r["unit"].pack(side="left", padx=(SPACE_XS, 0), after=last)
+
+    def criteria(self) -> dict:
+        rules = []
+        for r in self.rows:
+            f = self._field(r)
+            code = self._op_code(r)
+            rule = {"field": f.name, "op": code}
+            if code not in advsearch.NO_VALUE_OPS:
+                v = r["value"].get().strip()
+                if f.type == "choice":
+                    v = next((c for c, lbl in f.choices if lbl == v), v)
+                rule["value"] = v
+                if code == "between":
+                    rule["value2"] = r["value2"].get().strip()
+            rules.append(rule)
+        return {"match": self.match.get(), "rules": rules}
+
+    def reset(self) -> None:
+        self.load({"match": "all", "rules": [{"field": "filename", "op": "contains"}]})
+        self.result_label.config(text="")
+
+    # -- actions -------------------------------------------------------------------
+    def refresh_coverage(self) -> None:
+        total, analysed, with_exif = self.app.metadata_coverage()
+        if total == 0:
+            self.coverage.config(text="Aucune photo dans la source courante.")
+        elif analysed < total:
+            self.coverage.config(text=f"Métadonnées analysées : {format_count(analysed)} sur {format_count(total)} "
+                                      "photos. Les critères marqués « Photo » (appareil, dimensions, ISO, GPS…) "
+                                      "ne peuvent retenir que des photos analysées.")
+        else:
+            self.coverage.config(text=f"Métadonnées analysées pour les {format_count(total)} photos "
+                                      f"({format_count(with_exif)} avec EXIF).")
+
+    def _analyze(self) -> None:
+        self.app.analyze_metadata(parent=self.win, done=lambda: self.win.winfo_exists() and self.refresh_coverage())
+
+    def apply(self) -> None:
+        crit = self.criteria()
+        try:
+            advsearch.compile_criteria(crit, self.dialect, self.app.annotation_source())
+        except advsearch.CriteriaError as exc:
+            messagebox.showwarning("Recherche avancée", str(exc), parent=self.win)
+            return
+        self.result_label.config(text="Recherche en cours…")
+        self.app.run_advanced_search(crit, title="Recherche avancée",
+                                     done=lambda n, warns: self.win.winfo_exists() and self.result_label.config(
+                                         text=f"{plural(n, 'photo trouvée', 'photos trouvées')}"
+                                              + (f" — {warns[0]}" if warns else "")))
+
+    def _fill_saved(self) -> None:
+        m = self.saved_menu
+        m.delete(0, "end")
+        saved = self.app.collections.searches()
+        if not saved:
+            m.add_command(label="(aucune recherche enregistrée)", state="disabled")
+        for sid, name, crit in saved:
+            m.add_command(label=name, command=lambda c=crit: self.load(c))
+        if saved:
+            m.add_separator()
+            sub = tk.Menu(m, tearoff=False)
+            for sid, name, _c in saved:
+                sub.add_command(label=name, command=lambda i=sid, n=name: self._delete_saved(i, n))
+            m.add_cascade(label="Supprimer", menu=sub)
+
+    def _delete_saved(self, sid: int, name: str) -> None:
+        if messagebox.askyesno("Supprimer", f"Supprimer la recherche enregistrée « {name} » ?", parent=self.win):
+            self.app.collections.delete_search(sid)
+            self.app.refresh_smart_entries()
+
+    def _validated(self) -> Optional[dict]:
+        crit = self.criteria()
+        try:
+            advsearch.compile_criteria(crit, self.dialect, self.app.annotation_source())
+        except advsearch.CriteriaError as exc:
+            messagebox.showwarning("Recherche avancée", str(exc), parent=self.win)
+            return None
+        return crit
+
+    def save_search(self) -> None:
+        crit = self._validated()
+        if crit is None:
+            return
+        d = TextDialog(self.app, self.win, "Enregistrer la recherche", "Enregistrer la recherche",
+                       "Nom de la recherche", advsearch.describe(crit)[:60], icon="search", ok_text="Enregistrer")
+        if d.result:
+            self.app.collections.save_search(d.result, crit)
+            self.app.refresh_smart_entries()
+            self.app._set_status(f"Recherche « {d.result} » enregistrée.")
+
+    def create_smart(self) -> None:
+        crit = self._validated()
+        if crit is None:
+            return
+        d = TextDialog(self.app, self.win, "Album intelligent", "Créer un album intelligent",
+                       "Nom de l'album", advsearch.describe(crit)[:60], icon="smart", ok_text="Créer")
+        if d.result:
+            self.app.collections.create(d.result, "smart", crit)
+            self.app.refresh_smart_entries()
+            self.app._set_status(f"Album intelligent « {d.result} » créé : il se met à jour à chaque ouverture.")
+
+    def save_smart(self) -> None:
+        crit = self._validated()
+        if crit is None:
+            return
+        self.app.collections.set_criteria(self.smart_id, crit)
+        self.app.refresh_smart_entries()
+        self.win.destroy()
+        self.app.open_smart(self.smart_id)
+
+
+SCOPE_LABELS = (("selection", "La sélection"), ("view", "La vue affichée"), ("source", "Toute la source"))
+
+
+class ExportDialog(_Dialog):
+    """Export des métadonnées en CSV ou JSON."""
+
+    def __init__(self, app: "MainWindow", parent, scope: str = ""):
+        super().__init__(app, parent, "Exporter les métadonnées — iphotor", "Exporter les métadonnées",
+                         "CSV (tableur) ou JSON. Le fichier est écrit uniquement à l'emplacement choisi.",
+                         icon="file")
+        b = self.body
+        ttk.Label(b, text="PHOTOS À EXPORTER", style="Section.TLabel").pack(anchor="w")
+        self.scope = tk.StringVar(value=scope or ("selection" if app.selection else "view"))
+        row = ttk.Frame(b, style="Panel.TFrame")
+        row.pack(anchor="w", pady=(SPACE_XS, SPACE_M))
+        for code, label in SCOPE_LABELS:
+            n = app.scope_count(code)
+            rb = ttk.Radiobutton(row, text=f"{label} ({format_count(n)})", value=code, variable=self.scope)
+            rb.pack(side="left", padx=(0, SPACE_L))
+            if n == 0:
+                rb.state(["disabled"])
+        ttk.Label(b, text="FORMAT", style="Section.TLabel").pack(anchor="w")
+        self.fmt = tk.StringVar(value="csv")
+        row = ttk.Frame(b, style="Panel.TFrame")
+        row.pack(anchor="w", pady=(SPACE_XS, SPACE_M))
+        ttk.Radiobutton(row, text="CSV (séparateur « ; », UTF-8)", value="csv", variable=self.fmt).pack(side="left")
+        ttk.Radiobutton(row, text="JSON", value="json", variable=self.fmt).pack(side="left", padx=(SPACE_L, 0))
+        hdr = ttk.Frame(b, style="Panel.TFrame")
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text="CHAMPS", style="Section.TLabel").pack(side="left")
+        ttk.Button(hdr, text="Aucun", style="Ghost.TButton", command=lambda: self._all(False)).pack(side="right")
+        ttk.Button(hdr, text="Tous", style="Ghost.TButton", command=lambda: self._all(True)).pack(side="right")
+        grid = ttk.Frame(b, style="Panel.TFrame")
+        grid.pack(fill="x", pady=(SPACE_XS, 0))
+        self.vars = {}
+        for i, (key, label) in enumerate(mexport.FIELDS):
+            v = tk.BooleanVar(value=True)
+            self.vars[key] = v
+            ttk.Checkbutton(grid, text=label, variable=v).grid(row=i // 3, column=i % 3, sticky="w", padx=(0, SPACE_L))
+        ttk.Label(b, text="Les champs EXIF ne sont remplis que pour les photos dont les métadonnées ont été "
+                          "analysées (Outils › Analyser les métadonnées).", style="Small.TLabel",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(SPACE_M, 0))
+        self.buttons("Exporter…", self.ok)
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self._grab()
+
+    def _all(self, on: bool) -> None:
+        for v in self.vars.values():
+            v.set(on)
+
+    def ok(self) -> None:
+        fields = [k for k, _ in mexport.FIELDS if self.vars[k].get()]
+        if not fields:
+            messagebox.showwarning("Export", "Choisissez au moins un champ.", parent=self.win)
+            return
+        fmt = self.fmt.get()
+        start = self.app.settings.copy_dest if os.path.isdir(self.app.settings.copy_dest or "") else os.path.expanduser("~")
+        path = filedialog.asksaveasfilename(parent=self.win, title="Fichier d'export", initialdir=start,
+                                            initialfile=f"iphotor-metadonnees.{fmt}", defaultextension=f".{fmt}",
+                                            filetypes=[("CSV", "*.csv")] if fmt == "csv" else [("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            mexport.check_destination(path, self.app._protected_roots())
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Export impossible", str(exc), parent=self.win)
+            return
+        scope = self.scope.get()
+        self.win.destroy()
+        self.app.export_metadata(scope, fmt, fields, path)
+
+
+def draw_bars(c, x: int, y: int, w: int, title: str, data: list, color: str, fonts, max_items: int = 15,
+              vertical: bool = False) -> int:
+    """Diagramme en barres simple sur un Canvas ; renvoie la hauteur utilisée."""
+    c.create_text(x, y, text=title, anchor="nw", fill=COLORS["text"], font=fonts["bold"])
+    y0 = y + 26
+    data = [(str(k), v) for k, v in data][:max_items] if not vertical else [(str(k), v) for k, v in data]
+    if not data or not any(v for _k, v in data):
+        c.create_text(x, y0, text="Aucune donnée disponible.", anchor="nw", fill=COLORS["muted"], font=fonts["small"])
+        return 56
+    vmax = max(v for _k, v in data) or 1
+    if vertical:
+        h = 150
+        n = len(data)
+        bw = max(4, min(42, (w - 10) // max(1, n) - 4))
+        for i, (k, v) in enumerate(data):
+            bh = int((h - 30) * v / vmax)
+            bx = x + i * (bw + 4)
+            c.create_rectangle(bx, y0 + h - 20 - bh, bx + bw, y0 + h - 20, fill=color, outline="")
+            if n <= 24 or i % max(1, n // 12) == 0:
+                c.create_text(bx + bw / 2, y0 + h - 16, text=k if len(k) <= 6 else k[:5] + ".", anchor="n",
+                              fill=COLORS["muted"], font=fonts["badge"])
+            if v and (n <= 16):
+                c.create_text(bx + bw / 2, y0 + h - 24 - bh, text=format_count(v), anchor="s",
+                              fill=COLORS["muted"], font=fonts["badge"])
+        return h + 34
+    label_w = 170
+    for i, (k, v) in enumerate(data):
+        yy = y0 + i * 22
+        c.create_text(x, yy + 8, text=(k if len(k) <= 26 else k[:25] + "…"), anchor="w", fill=COLORS["text"],
+                      font=fonts["small"])
+        bw = int((w - label_w - 70) * v / vmax)
+        c.create_rectangle(x + label_w, yy + 2, x + label_w + max(2, bw), yy + 15, fill=color, outline="")
+        c.create_text(x + label_w + max(2, bw) + 6, yy + 8, text=format_count(v), anchor="w",
+                      fill=COLORS["muted"], font=fonts["small"])
+    return 26 + len(data) * 22 + 12
+
+
+class StatsWindow:
+    """Statistiques photographiques (calculées localement)."""
+
+    def __init__(self, app: "MainWindow"):
+        self.app = app
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Statistiques — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.geometry("980x760")
+        self.win.minsize(700, 420)
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_M))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get("library", 28, "accent"), style="Panel.TLabel").pack(side="left", padx=(0, SPACE_M))
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text="Statistiques", style="Title.TLabel").pack(anchor="w")
+        self.sub = ttk.Label(txt, text="", style="Muted.TLabel", wraplength=600, justify="left")
+        self.sub.pack(anchor="w")
+        self.scope = tk.StringVar(value="source")
+        box = ttk.Combobox(head, state="readonly", width=22,
+                           values=[lbl for code, lbl in SCOPE_LABELS if app.scope_count(code)])
+        box.set("Toute la source")
+        box.pack(side="right")
+        box.bind("<<ComboboxSelected>>", lambda e: (box.selection_clear(), self.compute(
+            next(c for c, l in SCOPE_LABELS if l == box.get()))))
+        ab = ttk.Button(head, text="Analyser…", image=app.icons.get("refresh", 16), compound="left",
+                        command=lambda: app.analyze_metadata(parent=self.win, done=lambda: self.compute(self.scope.get())))
+        ab.pack(side="right", padx=(0, SPACE_S))
+        Tooltip(ab, "Analyser les métadonnées (EXIF, GPS) des photos qui ne le sont pas encore")
+        ttk.Separator(self.win, orient="horizontal").pack(fill="x")
+        frame = ttk.Frame(self.win, style="Bg.TFrame")
+        frame.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(frame, bg=COLORS["bg"], highlightthickness=0)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview, style="Grid.Vertical.TScrollbar")
+        self.canvas.configure(yscrollcommand=sb.set, yscrollincrement=20)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for seq, d in (("<Button-4>", -3), ("<Button-5>", 3)):
+            self.canvas.bind(seq, lambda e, d=d: self.canvas.yview_scroll(d, "units"))
+        self.canvas.bind("<Configure>", lambda e: self.stats and self.render(self.stats))
+        self.stats = None
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.compute("source")
+
+    def compute(self, scope: str) -> None:
+        self.scope.set(scope)
+        self.canvas.delete("all")
+        self.canvas.create_text(30, 30, text="Calcul des statistiques…", anchor="nw", fill=COLORS["muted"],
+                                font=self.app.font_big)
+        t0 = time.time()
+
+        def done(result, error):
+            if not self.win.winfo_exists():
+                return
+            if error is not None:
+                self.canvas.delete("all")
+                self.canvas.create_text(30, 30, text=f"Calcul impossible : {error}", anchor="nw",
+                                        fill=COLORS["missing"], font=self.app.font_big)
+                return
+            self.stats = result
+            self.sub.config(text=f"{dict(SCOPE_LABELS)[scope]} — calculées en {time.time() - t0:.1f} s, "
+                                 f"à partir de l'index local (aucun fichier relu).")
+            self.render(result)
+
+        self.app.compute_stats(scope, done)
+
+    def render(self, s: dict) -> None:
+        c = self.canvas
+        c.delete("all")
+        f = self.app.fonts
+        w = max(600, c.winfo_width())
+        pad = SPACE_XL
+        y = pad
+        tiles = [
+            ("Photos et vidéos", format_count(s["total"])), ("Vidéos", format_count(s["videos"])),
+            ("Fichiers RAW", format_count(s["raw"])),
+            ("Taille totale", statlib.format_bytes(s["size_total"]) + ("" if s["size_known"] == s["total"] else " (connue)")),
+            ("Taille moyenne", statlib.format_bytes(s["size_avg"]) if s["size_known"] else "—"),
+            ("Géolocalisées", f"{s['gps_pct']:.0f} %".replace(".", ",") if s["analysed"] else "—"),
+            ("Sans date exploitable", format_count(s["no_date"])),
+            ("Sans EXIF", format_count(s["without_exif"]) if s["analysed"] else "—"),
+        ]
+        cols = max(2, min(4, (w - 2 * pad) // 210))
+        tw = (w - 2 * pad - (cols - 1) * 12) // cols
+        for i, (label, value) in enumerate(tiles):
+            x0 = pad + (i % cols) * (tw + 12)
+            y0 = y + (i // cols) * 84
+            c.create_rectangle(x0, y0, x0 + tw, y0 + 72, fill=COLORS["card"], outline=COLORS["card_border"])
+            c.create_text(x0 + 14, y0 + 12, text=label, anchor="nw", fill=COLORS["muted"], font=f["small"])
+            c.create_text(x0 + 14, y0 + 32, text=value, anchor="nw", fill=COLORS["text"], font=f["title"])
+        y += ((len(tiles) + cols - 1) // cols) * 84 + 8
+        if s["analysed"] < s["total"]:
+            c.create_text(pad, y, text=f"Métadonnées analysées pour {format_count(s['analysed'])} photos sur "
+                                       f"{format_count(s['total'])} : appareils, objectifs, ISO, focales, dimensions "
+                                       "et GPS ne portent que sur celles-ci.",
+                          anchor="nw", fill=COLORS["missing"] if s["analysed"] == 0 else COLORS["muted"],
+                          font=f["small"], width=w - 2 * pad)
+            y += 34
+        acc, sec = COLORS["accent_fill"], COLORS["secondary"]
+        y += draw_bars(c, pad, y, w - 2 * pad, "Photos par année", s["years"], acc, f, vertical=True)
+        y += draw_bars(c, pad, y, w - 2 * pad, "Photos par mois (toutes années)", s["months"], sec, f, vertical=True)
+        half = (w - 2 * pad - 24) // 2
+        rows = [("Extensions", s["extensions"], "Dimensions les plus fréquentes", s["dimensions"]),
+                ("Appareils les plus utilisés", s["cameras"], "Objectifs les plus utilisés", s["lenses"]),
+                ("Sensibilité ISO", s["iso"], "Focales (équivalent 24×36 si connu)", s["focal"])]
+        for t1, d1, t2, d2 in rows:
+            h1 = draw_bars(c, pad, y, half, t1, d1, acc, f, max_items=10)
+            h2 = draw_bars(c, pad + half + 24, y, half, t2, d2, sec, f, max_items=10)
+            y += max(h1, h2) + 8
+        c.configure(scrollregion=(0, 0, w, y + pad))
+
+
+class DuplicatesWindow:
+    """Résultats de la détection des doublons. Aucune suppression : copie possible des versions retenues."""
+
+    def __init__(self, app: "MainWindow", report: "dupes.Report", saved_at: Optional[float] = None):
+        self.app = app
+        self.report = report
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Doublons — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.geometry("1180x700")
+        self.win.minsize(820, 420)
+        self._thumb = None
+        self._thumb_req = 0
+        self._res: "queue.Queue[tuple]" = queue.Queue()
+        counts = report.counts()
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_M))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get("copy", 28, "accent"), style="Panel.TLabel").pack(side="left", padx=(0, SPACE_M))
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text="Doublons et photos proches", style="Title.TLabel").pack(anchor="w")
+        when = f" — résultats du {_dt.datetime.fromtimestamp(saved_at).strftime('%d/%m/%Y à %H:%M')}" if saved_at else ""
+        ttk.Label(txt, text=f"{format_count(report.analysed)} fichiers analysés : {counts[dupes.IDENTICAL]} groupe(s) "
+                            f"identiques, {counts[dupes.NEAR]} quasi-identiques, {counts[dupes.SIMILAR]} proches"
+                            f"{when}. Aucun fichier n'est jamais supprimé.",
+                  style="Muted.TLabel", wraplength=900, justify="left").pack(anchor="w")
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        ttk.Button(foot, text="Fermer", style="Accent.TButton", command=self.win.destroy).pack(side="right")
+        self.btn_copy = ttk.Button(foot, text="Copier la sélection vers…", image=app.icons.get("folder_arrow", 16),
+                                   compound="left", command=self.copy_selected)
+        self.btn_copy.pack(side="right", padx=(0, SPACE_S))
+        self.btn_cmp = ttk.Button(foot, text="Comparer", image=app.icons.get("library", 16), compound="left",
+                                  command=self.compare)
+        self.btn_cmp.pack(side="right", padx=(0, SPACE_S))
+        self.btn_grid = ttk.Button(foot, text="Afficher le groupe dans la grille", command=self.show_in_grid)
+        self.btn_grid.pack(side="left")
+        ttk.Label(foot, text="Ctrl+clic : sélectionner plusieurs fichiers.", style="Footer.TLabel").pack(
+            side="left", padx=(SPACE_M, 0))
+        body = tk.PanedWindow(self.win, orient="horizontal", sashwidth=5, bg=COLORS["panel"], bd=0)
+        body.pack(fill="both", expand=True, padx=SPACE_L, pady=SPACE_S)
+        left = ttk.Frame(body, style="Panel.TFrame")
+        cols = ("loc", "dims", "date", "size", "sim")
+        self.tree = ttk.Treeview(left, columns=cols, show="tree headings", selectmode="extended", style="Item.Treeview")
+        for col, label, w in (("#0", "Fichier", 300), ("loc", "Emplacement", 200), ("dims", "Dimensions", 95),
+                              ("date", "Date", 125), ("size", "Taille", 70), ("sim", "Similarité", 120)):
+            self.tree.heading(col, text=label, anchor="w")
+            self.tree.column(col, width=w, stretch=col in ("#0", "loc"))
+        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("group", font=app.font_bold)
+        self.tree.tag_configure("missing", foreground=COLORS["missing"])
+        body.add(left, minsize=480, width=830)
+        right = ttk.Frame(body, style="Panel.TFrame", padding=(SPACE_M, 0, 0, 0))
+        self.preview = tk.Canvas(right, bg=COLORS["well"], highlightthickness=0, width=300, height=300)
+        self.preview.pack(fill="both", expand=True)
+        self.info = ttk.Label(right, text="", style="Small.TLabel", wraplength=300, justify="left")
+        self.info.pack(anchor="w", pady=(SPACE_S, 0))
+        body.add(right, minsize=240)
+        self.entries: dict[str, tuple] = {}
+        icon = {dupes.IDENTICAL: "copy", dupes.NEAR: "image_off", dupes.SIMILAR: "photos"}
+        for gi, g in enumerate(report.groups):
+            title = {dupes.IDENTICAL: "Contenu identique", dupes.NEAR: "Quasi-identiques (redimensionnée, recompressée…)",
+                     dupes.SIMILAR: "Photos proches — même série possible, pas forcément des doublons"}[g.level]
+            gid = self.tree.insert("", "end", iid=f"g{gi}", text=f" {title} · {len(g.entries)} fichiers",
+                                   values=("", "", "", "", g.similarity), tags=("group",), open=gi < 30,
+                                   image=app.icons.get(icon[g.level], 16, "accent"))
+            for ei, e in enumerate(g.entries):
+                iid = f"g{gi}e{ei}"
+                exists = os.path.isfile(e.path)
+                self.tree.insert(gid, "end", iid=iid, text=os.path.basename(e.path),
+                                 values=(safe_text(os.path.dirname(e.path)),
+                                         f"{e.width} × {e.height}" if e.width else "—",
+                                         format_date(storage.unix_to_apple(e.date)) if e.date else "—",
+                                         format_size(e.size) if e.size else "—",
+                                         "" if g.level == dupes.IDENTICAL or not e.phash or not g.entries[0].phash
+                                         else f"{dupes.distance(e.phash, g.entries[0].phash)} bit(s) d'écart"),
+                                 tags=() if exists else ("missing",))
+                self.entries[iid] = (gi, e)
+        if not report.groups:
+            self.tree.insert("", "end", text="Aucun doublon ni photo proche trouvé.")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self._update_buttons()
+        self._poll()
+
+    def _selected_entries(self) -> list:
+        return [self.entries[i][1] for i in self.tree.selection() if i in self.entries]
+
+    def _update_buttons(self) -> None:
+        sel = self._selected_entries()
+        self.btn_cmp.state(["!disabled"] if len(sel) == 2 else ["disabled"])
+        self.btn_copy.state(["!disabled"] if sel else ["disabled"])
+
+    def _on_select(self, _e=None) -> None:
+        self._update_buttons()
+        sel = self.tree.selection()
+        if not sel or sel[-1] not in self.entries:
+            return
+        e = self.entries[sel[-1]][1]
+        self.info.config(text=f"{safe_text(e.path)}\n{format_size(e.size) if e.size else ''}"
+                              + (f"\nSHA-256 : {e.sha256[:16]}…" if e.sha256 else ""))
+        self._thumb_req += 1
+        no = self._thumb_req
+        w, h = max(200, self.preview.winfo_width()), max(200, self.preview.winfo_height())
+
+        def work():
+            try:
+                self._res.put((no, load_pil_image(e.path, w - 16, h - 16), None))
+            except Exception as exc:
+                self._res.put((no, None, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self) -> None:
+        if not self.win.winfo_exists():
+            return
+        try:
+            while True:
+                no, img, err = self._res.get_nowait()
+                if no != self._thumb_req:
+                    continue
+                self.preview.delete("all")
+                w, h = self.preview.winfo_width(), self.preview.winfo_height()
+                if img is None:
+                    self.preview.create_text(w // 2, h // 2, text=f"Aperçu impossible\n{err}", fill=COLORS["muted"],
+                                             justify="center", width=w - 20)
+                else:
+                    self._thumb = ImageTk.PhotoImage(img)
+                    self.preview.create_image(w // 2, h // 2, image=self._thumb)
+        except queue.Empty:
+            pass
+        self.win.after(80, self._poll)
+
+    def compare(self) -> None:
+        sel = self._selected_entries()
+        if len(sel) == 2:
+            CompareWindow(self.app, [(os.path.basename(e.path), e.path, e.key) for e in sel])
+
+    def copy_selected(self) -> None:
+        sel = self._selected_entries()
+        if not sel:
+            return
+        photos = [self.app.photo_from_path(e.path) for e in sel]
+        self.app._start_copy([(p, "") for p in photos], f"{plural(len(photos), 'fichier retenu', 'fichiers retenus')}",
+                             plural(len(photos), "fichier"), "", parent=self.win)
+
+    def show_in_grid(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        gi = int(sel[0][1:].split("e")[0])
+        keys = {e.key for e in self.report.groups[gi].entries}
+        self.app.show_keys_in_grid(keys, f"Doublons : groupe {gi + 1}")
+
+
+class CompareWindow:
+    """Comparaison de deux photos : côte à côte (zoom et déplacement synchronisés) ou rideau."""
+
+    FIELDS = (("Fichier", "filename"), ("Dimensions", "dims"), ("Date de prise de vue", "taken"),
+              ("Taille du fichier", "size"), ("Appareil", "camera"), ("Objectif", "lens"), ("Focale", "focal"),
+              ("Ouverture", "aperture"), ("Temps de pose", "exposure"), ("ISO", "iso"), ("GPS", "gps"),
+              ("Emplacement", "folder"))
+
+    def __init__(self, app: "MainWindow", items: list):
+        """items : deux tuples (libellé, chemin, clé de métadonnées)."""
+        self.app = app
+        self.items = items[:2]
+        self.pils = [None, None]
+        self.tk = [None, None]
+        self.zoom = 1.0           # 1.0 = image entière visible
+        self.center = (0.5, 0.5)  # centre de la vue, en coordonnées relatives de l'image
+        self.mode = tk.StringVar(value="side")
+        self.split = 0.5
+        self._drag = None
+        self._job = None
+        self.res: "queue.Queue[tuple]" = queue.Queue()
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Comparer — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        sw, sh = app.root.winfo_screenwidth(), app.root.winfo_screenheight()
+        self.win.geometry(f"{int(sw * 0.8)}x{int(sh * 0.82)}")
+        self.win.minsize(700, 480)
+        bar = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_M, SPACE_S))
+        bar.pack(fill="x")
+        ttk.Radiobutton(bar, text="Côte à côte", value="side", variable=self.mode, style="Segment.Toolbutton",
+                        command=self.render).pack(side="left")
+        ttk.Radiobutton(bar, text="Rideau", value="curtain", variable=self.mode, style="Segment.Toolbutton",
+                        command=self.render).pack(side="left", padx=(2, 0))
+        ttk.Button(bar, text="Ajuster", style="Ghost.TButton", command=self.fit).pack(side="left", padx=(SPACE_M, 0))
+        ttk.Button(bar, text="100 %", style="Ghost.TButton", command=self.actual).pack(side="left")
+        ttk.Button(bar, text="Inverser", style="Ghost.TButton", command=self.swap).pack(side="left")
+        ttk.Label(bar, text="Molette : zoom synchronisé · glisser : déplacer · rideau : glisser la séparation",
+                  style="Muted.TLabel").pack(side="right")
+        ttk.Separator(self.win, orient="horizontal").pack(fill="x")
+        self.table = ttk.Treeview(self.win, columns=("a", "b"), show="tree headings", height=12, style="Item.Treeview")
+        self.table.heading("#0", text="", anchor="w")
+        self.table.column("#0", width=170, stretch=False)
+        self.table.pack(side="bottom", fill="x", padx=SPACE_L, pady=SPACE_S)
+        self.table.tag_configure("diff", foreground=COLORS["accent"], font=app.font_bold)
+        self.area = ttk.Frame(self.win, style="Panel.TFrame")
+        self.area.pack(fill="both", expand=True)
+        self.canvases = [tk.Canvas(self.area, bg=COLORS["viewer_bg"], highlightthickness=0) for _ in range(2)]
+        for cv in self.canvases:
+            cv._viewer = True
+            cv.bind("<Configure>", lambda e: self._schedule())
+            cv.bind("<Button-4>", lambda e: self._wheel(e, 1.25))
+            cv.bind("<Button-5>", lambda e: self._wheel(e, 0.8))
+            cv.bind("<MouseWheel>", lambda e: self._wheel(e, 1.25 if e.delta > 0 else 0.8))
+            cv.bind("<ButtonPress-1>", self._press)
+            cv.bind("<B1-Motion>", self._motion)
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self._fill_table()
+        for i, (_label, path, _key) in enumerate(self.items):
+            threading.Thread(target=self._load, args=(i, path), daemon=True).start()
+        self._poll()
+
+    def _load(self, i: int, path: str) -> None:
+        try:
+            self.res.put((i, load_pil_image(path, 2600, 2600), None))
+        except Exception as exc:
+            self.res.put((i, None, str(exc)))
+
+    def _poll(self) -> None:
+        if not self.win.winfo_exists():
+            return
+        try:
+            while True:
+                i, img, err = self.res.get_nowait()
+                self.pils[i] = img if img is not None else err
+                self.render()
+        except queue.Empty:
+            pass
+        self.win.after(60, self._poll)
+
+    def _meta(self, path: str, key: str) -> dict:
+        m = self.app.meta_record(key, path) or {}
+        if not m.get("width"):
+            try:
+                m = {**mdlib.extract(path), **{k: v for k, v in m.items() if v is not None}}
+            except Exception:
+                pass
+        return m
+
+    def _fill_table(self) -> None:
+        metas = [self._meta(p, k) for _l, p, k in self.items]
+        self.table.heading("a", text=self.items[0][0], anchor="w")
+        self.table.heading("b", text=self.items[1][0], anchor="w")
+
+        def val(m, f, path):
+            if f == "filename":
+                return os.path.basename(path)
+            if f == "folder":
+                return safe_text(os.path.dirname(path))
+            if f == "dims":
+                return f"{m['width']} × {m['height']} px" if m.get("width") else "—"
+            if f == "taken":
+                return format_date(storage.unix_to_apple(m["taken"])) if m.get("taken") else "—"
+            if f == "size":
+                return format_size(m["file_size"]) if m.get("file_size") else "—"
+            if f == "camera":
+                mk, md = (m.get("make") or "").strip(), (m.get("model") or "").strip()
+                if mk and md.lower().startswith(mk.split()[0].lower()):
+                    return md
+                return " ".join(x for x in (mk, md) if x) or "—"
+            if f == "focal":
+                return f"{m['focal']:g} mm" if m.get("focal") else "—"
+            if f == "aperture":
+                return f"f/{m['aperture']:g}" if m.get("aperture") else "—"
+            if f == "exposure":
+                e = m.get("exposure")
+                return ("—" if not e else f"1/{round(1 / e)} s" if e < 1 else f"{e:g} s")
+            if f == "gps":
+                return geo.format_coords(m["gps_lat"], m["gps_lon"]) if m.get("gps_lat") is not None else "—"
+            v = m.get(f)
+            return "—" if v in (None, "") else str(v)
+        for label, f in self.FIELDS:
+            a, b = val(metas[0], f, self.items[0][1]), val(metas[1], f, self.items[1][1])
+            self.table.insert("", "end", text=label, values=(a, b),
+                              tags=("diff",) if a != b and f not in ("filename", "folder") else ())
+
+    def fit(self) -> None:
+        self.zoom, self.center = 1.0, (0.5, 0.5)
+        self.render()
+
+    def actual(self) -> None:
+        img = self.pils[0] if not isinstance(self.pils[0], (str, type(None))) else self.pils[1]
+        if img is None or isinstance(img, str):
+            return
+        cv = self.canvases[0]
+        fit = min(cv.winfo_width() / img.width, cv.winfo_height() / img.height)
+        self.zoom = max(1.0, 1.0 / fit) if fit < 1 else 1.0
+        self.render()
+
+    def swap(self) -> None:
+        self.items.reverse()
+        self.pils.reverse()
+        self.table.delete(*self.table.get_children())
+        self._fill_table()
+        self.render()
+
+    def _wheel(self, e, factor: float) -> None:
+        self.zoom = max(1.0, min(16.0, self.zoom * factor))
+        if self.zoom == 1.0:
+            self.center = (0.5, 0.5)
+        self._schedule()
+
+    def _press(self, e) -> None:
+        self._drag = (e.x, e.y, self.center, e.widget)
+        if self.mode.get() == "curtain":
+            self.split = min(0.98, max(0.02, e.x / max(1, e.widget.winfo_width())))
+            self.render()
+
+    def _motion(self, e) -> None:
+        if self._drag is None:
+            return
+        if self.mode.get() == "curtain" and self.zoom == 1.0:
+            self.split = min(0.98, max(0.02, e.x / max(1, e.widget.winfo_width())))
+            self._schedule(10)
+            return
+        x0, y0, (cx, cy), cv = self._drag
+        img = next((p for p in self.pils if p is not None and not isinstance(p, str)), None)
+        if img is None:
+            return
+        scale = self._scale(img, cv)
+        self.center = (min(1, max(0, cx - (e.x - x0) / (img.width * scale))),
+                       min(1, max(0, cy - (e.y - y0) / (img.height * scale))))
+        self._schedule(15)
+
+    def _scale(self, img, cv) -> float:
+        return min(cv.winfo_width() / img.width, cv.winfo_height() / img.height, 1.0) * self.zoom
+
+    def _schedule(self, delay: int = 60) -> None:
+        if self._job:
+            self.win.after_cancel(self._job)
+        self._job = self.win.after(delay, self.render)
+
+    def _view(self, img, cv):
+        """Partie visible de l'image (zoom et centre partagés), redimensionnée pour le canevas."""
+        cw, ch = max(cv.winfo_width(), 10), max(cv.winfo_height(), 10)
+        s = self._scale(img, cv)
+        vw, vh = min(img.width, cw / s), min(img.height, ch / s)
+        cx, cy = self.center[0] * img.width, self.center[1] * img.height
+        x0 = min(max(0, cx - vw / 2), img.width - vw)
+        y0 = min(max(0, cy - vh / 2), img.height - vh)
+        crop = img.crop((int(x0), int(y0), int(x0 + vw), int(y0 + vh)))
+        size = (max(1, int(crop.width * s)), max(1, int(crop.height * s)))
+        return crop.resize(size, Image.BILINEAR if s < 2 else Image.NEAREST)
+
+    def render(self) -> None:
+        self._job = None
+        side = self.mode.get() == "side"
+        for cv in self.canvases:
+            cv.pack_forget()
+        if side:
+            self.canvases[0].pack(side="left", fill="both", expand=True, padx=(0, 1))
+            self.canvases[1].pack(side="left", fill="both", expand=True)
+        else:
+            self.canvases[0].pack(fill="both", expand=True)
+        self.win.update_idletasks()
+        for i, cv in enumerate(self.canvases if side else self.canvases[:1]):
+            cv.delete("all")
+        if side:
+            for i, cv in enumerate(self.canvases):
+                self._draw(cv, i)
+        else:
+            self._draw_curtain(self.canvases[0])
+
+    def _draw(self, cv, i: int) -> None:
+        cw, ch = cv.winfo_width(), cv.winfo_height()
+        img = self.pils[i]
+        if img is None or isinstance(img, str):
+            cv.create_text(cw // 2, ch // 2, text="Chargement…" if img is None else f"Image illisible\n{img}",
+                           fill=COLORS["viewer_text"], justify="center", width=cw - 40)
+        else:
+            self.tk[i] = ImageTk.PhotoImage(self._view(img, cv))
+            cv.create_image(cw // 2, ch // 2, image=self.tk[i])
+        cv.create_text(12, 12, text=self.items[i][0], anchor="nw", fill="#FFFFFF", font=self.app.font_bold)
+
+    def _draw_curtain(self, cv) -> None:
+        cw, ch = cv.winfo_width(), cv.winfo_height()
+        imgs = [p for p in self.pils if p is not None and not isinstance(p, str)]
+        if len(imgs) < 2:
+            cv.create_text(cw // 2, ch // 2, text="Chargement…", fill=COLORS["viewer_text"])
+            return
+        a = self._view(self.pils[0], cv)
+        b = self._view(self.pils[1], cv).resize(a.size, Image.BILINEAR)
+        cut = int(a.width * self.split)
+        comp = a.copy()
+        comp.paste(b.crop((cut, 0, b.width, b.height)), (cut, 0))
+        self.tk[0] = ImageTk.PhotoImage(comp)
+        x0 = (cw - a.width) // 2
+        cv.create_image(cw // 2, ch // 2, image=self.tk[0])
+        cv.create_line(x0 + cut, 0, x0 + cut, ch, fill="#FFFFFF", width=2)
+        cv.create_text(x0 + cut - 10, 14, text=self.items[0][0], anchor="ne", fill="#FFFFFF", font=self.app.font_bold)
+        cv.create_text(x0 + cut + 10, 14, text=self.items[1][0], anchor="nw", fill="#FFFFFF", font=self.app.font_bold)
+
+
+class GeoWindow:
+    """Exploration géographique hors ligne (coordonnées GPS EXIF ; lieux Apple s'ils existent)."""
+
+    def __init__(self, app: "MainWindow", points: list, missing: int):
+        self.app = app
+        self.points = points
+        self.box = geo.bounds(points)
+        self.clusters: list = []
+        self.selected: Optional[int] = None
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Carte — iphotor")
+        self.win.configure(bg=COLORS["panel"])
+        self.win.geometry("1180x720")
+        self.win.minsize(820, 460)
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_M))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get("external", 28, "accent"), style="Panel.TLabel").pack(side="left", padx=(0, SPACE_M))
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text="Photos géolocalisées", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(txt, text=f"{format_count(len(points))} photos avec coordonnées GPS"
+                            + (f" ; {format_count(missing)} photos pas encore analysées" if missing else "")
+                            + ". Carte locale (points et graticule) : aucune donnée n'est envoyée sur Internet.",
+                  style="Muted.TLabel", wraplength=780, justify="left").pack(anchor="w")
+        self.level = tk.StringVar(value="secteur")
+        box = ttk.Combobox(head, state="readonly", width=20, values=[lbl for _n, _s, lbl in geo.LEVELS])
+        box.set(dict((n, l) for n, _s, l in geo.LEVELS)["secteur"])
+        box.pack(side="right")
+        box.bind("<<ComboboxSelected>>", lambda e: (box.selection_clear(), self.level.set(
+            next(n for n, _s, l in geo.LEVELS if l == box.get())), self.rebuild()))
+        ttk.Label(head, text="Regrouper par", style="Muted.TLabel").pack(side="right", padx=(0, SPACE_S))
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        ttk.Button(foot, text="Fermer", style="Accent.TButton", command=self.win.destroy).pack(side="right")
+        ttk.Button(foot, text="Ouvrir dans OpenStreetMap…", image=app.icons.get("external", 16), compound="left",
+                   command=self.open_osm).pack(side="right", padx=(0, SPACE_S))
+        ttk.Button(foot, text="Copier les coordonnées", command=self.copy_coords).pack(side="right", padx=(0, SPACE_S))
+        ttk.Button(foot, text="Afficher les photos dans la grille", image=app.icons.get("photos", 16), compound="left",
+                   command=self.show_grid).pack(side="left")
+        self.coord = ttk.Label(foot, text="", style="Footer.TLabel")
+        self.coord.pack(side="left", padx=(SPACE_M, 0))
+        body = tk.PanedWindow(self.win, orient="horizontal", sashwidth=5, bg=COLORS["panel"], bd=0)
+        body.pack(fill="both", expand=True, padx=SPACE_L, pady=SPACE_S)
+        left = ttk.Frame(body, style="Panel.TFrame")
+        self.tree = ttk.Treeview(left, columns=("n",), show="tree headings", selectmode="browse", style="Item.Treeview")
+        self.tree.heading("#0", text="Lieu", anchor="w")
+        self.tree.heading("n", text="Photos", anchor="e")
+        self.tree.column("n", width=70, anchor="e", stretch=False)
+        sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree)
+        body.add(left, minsize=260, width=360)
+        self.map = tk.Canvas(body, bg=COLORS["well"], highlightthickness=0)
+        self.map.bind("<Configure>", lambda e: self.draw())
+        self.map.bind("<Motion>", self._hover)
+        self.map.bind("<Button-1>", self._click)
+        body.add(self.map, minsize=400)
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        self.clusters = geo.clusters(self.points, self.level.get())
+        self.tree.delete(*self.tree.get_children())
+        for i, c in enumerate(self.clusters):
+            node = self.tree.insert("", "end", iid=f"c{i}", text=" " + c.name, values=(format_count(len(c.points)),),
+                                    image=self.app.icons.get("dot", 12, "accent"))
+            if c.places and len(c.places) > 1:
+                for name, n in sorted(c.places.items(), key=lambda kv: -kv[1])[:8]:
+                    self.tree.insert(node, "end", text=name, values=(format_count(n),))
+        self.selected = None
+        self.draw()
+
+    def draw(self) -> None:
+        c = self.map
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 50:
+            return
+        lat0, lat1, lon0, lon1 = self.box
+        step = geo.grid_step(max(lat1 - lat0, lon1 - lon0))
+        import math as _m
+        lat = _m.floor(lat0 / step) * step
+        while lat <= lat1:
+            x0, y = geo.project(lat, lon0, self.box, w, h)
+            x1, _ = geo.project(lat, lon1, self.box, w, h)
+            c.create_line(x0, y, x1, y, fill=COLORS["card_border"])
+            c.create_text(x0 + 4, y - 2, text=f"{lat:g}°", anchor="sw", fill=COLORS["faint"], font=self.app.font_badge)
+            lat += step
+        lon = _m.floor(lon0 / step) * step
+        while lon <= lon1:
+            x, y0 = geo.project(lat0, lon, self.box, w, h)
+            _, y1 = geo.project(lat1, lon, self.box, w, h)
+            c.create_line(x, y0, x, y1, fill=COLORS["card_border"])
+            c.create_text(x + 3, y0 - 3, text=f"{lon:g}°", anchor="sw", fill=COLORS["faint"], font=self.app.font_badge)
+            lon += step
+        if not self.points:
+            c.create_text(w // 2, h // 2, text="Aucune photo géolocalisée.\nAnalysez les métadonnées (Outils) si ce "
+                                               "n'est pas encore fait.", fill=COLORS["muted"], justify="center",
+                          font=self.app.font_big)
+            return
+        for p in self.points[:20000]:
+            x, y = geo.project(p.lat, p.lon, self.box, w, h)
+            c.create_oval(x - 2, y - 2, x + 2, y + 2, fill=COLORS["secondary"], outline="")
+        boxes: list = []
+        order = sorted(range(min(400, len(self.clusters))), key=lambda i: (i != self.selected, i))
+        for i in order:
+            cl = self.clusters[i]
+            x, y = geo.project(cl.lat, cl.lon, self.box, w, h)
+            r = 6 + min(18, 3 * len(cl.points) ** 0.5)
+            sel = i == self.selected
+            c.create_oval(x - r, y - r, x + r, y + r, fill=COLORS["accent_fill"] if sel else "",
+                          outline=COLORS["accent"], width=3 if sel else 2, tags=(f"c{i}",))
+            label = f"{cl.name} ({len(cl.points)})"
+            tw = self.app.font_small.measure(label)
+            bx = (x + r + 4, y - 9, x + r + 8 + tw, y + 9)
+            if (sel or i < 30) and not any(bx[0] < b[2] and b[0] < bx[2] and bx[1] < b[3] and b[1] < bx[3]
+                                           for b in boxes):
+                boxes.append(bx)
+                if sel:
+                    c.create_rectangle(*bx, fill=COLORS["panel"], outline=COLORS["accent"])
+                c.create_text(x + r + 6, y, text=label, anchor="w", fill=COLORS["text"],
+                              font=self.app.font_bold if sel else self.app.font_small)
+
+    def _hover(self, e) -> None:
+        if self.points:
+            lat, lon = geo.unproject(e.x, e.y, self.box, self.map.winfo_width(), self.map.winfo_height())
+            self.coord.config(text=geo.format_coords(lat, lon))
+
+    def _click(self, e) -> None:
+        items = self.map.find_overlapping(e.x - 3, e.y - 3, e.x + 3, e.y + 3)
+        for it in reversed(items):
+            for t in self.map.gettags(it):
+                if t.startswith("c") and t[1:].isdigit():
+                    self.tree.selection_set(t)
+                    self.tree.see(t)
+                    return
+
+    def _on_tree(self, _e=None) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0] if sel[0].startswith("c") else self.tree.parent(sel[0])
+        try:
+            self.selected = int(iid[1:])
+        except ValueError:
+            return
+        cl = self.clusters[self.selected]
+        self.coord.config(text=f"{cl.name} — centre {geo.format_coords(cl.lat, cl.lon)} — {plural(len(cl.points), 'photo')}")
+        self.draw()
+
+    def _cluster(self):
+        if self.selected is None:
+            messagebox.showinfo("Carte", "Sélectionnez d'abord un lieu dans la liste ou sur la carte.", parent=self.win)
+            return None
+        return self.clusters[self.selected]
+
+    def show_grid(self) -> None:
+        cl = self._cluster()
+        if cl:
+            self.app.show_keys_in_grid({p.key for p in cl.points}, f"Lieu : {cl.name}")
+
+    def copy_coords(self) -> None:
+        cl = self._cluster()
+        if cl:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(f"{cl.lat:.6f}, {cl.lon:.6f}")
+            self.app._set_status("Coordonnées copiées.")
+
+    def open_osm(self) -> None:
+        cl = self._cluster()
+        if not cl:
+            return
+        if not messagebox.askyesno("Ouvrir OpenStreetMap",
+                                   "Le navigateur va ouvrir openstreetmap.org à cette position :\n"
+                                   f"{geo.format_coords(cl.lat, cl.lon)}\n\nLes coordonnées seront donc envoyées à ce "
+                                   "site. Continuer ?", parent=self.win):
+            return
+        try:
+            subprocess.Popen(["xdg-open", geo.osm_url(cl.lat, cl.lon)], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            messagebox.showerror("Carte", f"Impossible d'ouvrir le navigateur :\n{exc}", parent=self.win)
+
+
+class SlideshowWindow:
+    """Diaporama plein écran (images adaptées à l'écran, chargées dans un thread)."""
+
+    def __init__(self, app: "MainWindow", photos: list, start: int = 0):
+        self.app = app
+        st = app.settings
+        self.photos = [p for p in photos if not p.is_video] or photos
+        if st.slideshow_order == "random":
+            import random
+            self.photos = self.photos[:]
+            random.shuffle(self.photos)
+        self.index = max(0, min(start, len(self.photos) - 1))
+        self.playing = True
+        self.interval = st.slideshow_interval
+        self.loop = st.slideshow_loop
+        self.show_info = st.slideshow_info
+        self.cache: dict[int, object] = {}
+        self.res: "queue.Queue[tuple]" = queue.Queue()
+        self._timer = None
+        self._tk = None
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Diaporama — iphotor")
+        self.win.configure(bg="#000000")
+        self.win.attributes("-fullscreen", True)
+        self.canvas = tk.Canvas(self.win, bg="#000000", highlightthickness=0, cursor="none")
+        self.canvas.pack(fill="both", expand=True)
+        self.sw, self.sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        b = self.win.bind
+        b("<Escape>", lambda e: self.close())
+        b("<space>", lambda e: self.toggle())
+        b("<Right>", lambda e: self.step(1))
+        b("<Left>", lambda e: self.step(-1))
+        b("<plus>", lambda e: self.set_interval(self.interval + 1))
+        b("<KP_Add>", lambda e: self.set_interval(self.interval + 1))
+        b("<minus>", lambda e: self.set_interval(self.interval - 1))
+        b("<KP_Subtract>", lambda e: self.set_interval(self.interval - 1))
+        b("<KeyPress-i>", lambda e: self.toggle_info())
+        b("<KeyPress-l>", lambda e: self.toggle_loop())
+        b("<KeyPress-f>", lambda e: self.win.attributes("-fullscreen", not self.win.attributes("-fullscreen")))
+        self.canvas.bind("<Button-1>", lambda e: self.step(1))
+        self.canvas.bind("<Button-3>", lambda e: self.step(-1))
+        self.win.focus_force()
+        self._message = ""
+        self._poll()
+        self.show()
+
+    def _load(self, i: int) -> None:
+        p = self.photos[i]
+        lib = self.app.library
+        try:
+            path, _o = lib.find_display_file(p, for_thumbnail=False)
+            if not path:
+                raise FileNotFoundError("fichier introuvable")
+            self.res.put((i, load_pil_image(path, self.sw, self.sh), None))
+        except Exception as exc:
+            self.res.put((i, None, str(exc)))
+
+    def _request(self, i: int) -> None:
+        if 0 <= i < len(self.photos) and i not in self.cache:
+            self.cache[i] = None
+            threading.Thread(target=self._load, args=(i,), daemon=True).start()
+
+    def _poll(self) -> None:
+        if not self.win.winfo_exists():
+            return
+        try:
+            while True:
+                i, img, err = self.res.get_nowait()
+                self.cache[i] = img if img is not None else err
+                if i == self.index:
+                    self.render()
+        except queue.Empty:
+            pass
+        self.win.after(50, self._poll)
+
+    def show(self) -> None:
+        for k in [k for k in self.cache if abs(k - self.index) > 2]:
+            del self.cache[k]           # au plus 5 images en mémoire
+        self._request(self.index)
+        self._request(self.index + 1)
+        self.render()
+        self._arm()
+
+    def _arm(self) -> None:
+        if self._timer:
+            self.win.after_cancel(self._timer)
+            self._timer = None
+        if self.playing:
+            self._timer = self.win.after(self.interval * 1000, self._tick)
+
+    def _tick(self) -> None:
+        self._timer = None
+        if self.index >= len(self.photos) - 1 and not self.loop:
+            self.playing = False
+            self._flash("Fin du diaporama — Échap pour quitter")
+            return
+        self.step(1)
+
+    def step(self, d: int) -> None:
+        n = len(self.photos)
+        if not n:
+            return
+        j = self.index + d
+        if self.loop:
+            j %= n
+        self.index = max(0, min(n - 1, j))
+        self.show()
+
+    def toggle(self) -> None:
+        self.playing = not self.playing
+        self._flash("Lecture" if self.playing else "Pause")
+        self._arm()
+
+    def set_interval(self, v: int) -> None:
+        self.interval = max(1, min(60, v))
+        self.app.settings.slideshow_interval = self.interval
+        self.app.settings.save()
+        self._flash(f"Intervalle : {self.interval} s")
+        self._arm()
+
+    def toggle_info(self) -> None:
+        self.show_info = not self.show_info
+        self.app.settings.slideshow_info = self.show_info
+        self.app.settings.save()
+        self.render()
+
+    def toggle_loop(self) -> None:
+        self.loop = not self.loop
+        self.app.settings.slideshow_loop = self.loop
+        self.app.settings.save()
+        self._flash("Boucle activée" if self.loop else "Boucle désactivée")
+
+    def _flash(self, text: str) -> None:
+        self._message = text
+        self.render()
+        self.win.after(1500, lambda: (setattr(self, "_message", ""), self.render()) if self.win.winfo_exists() else None)
+
+    def render(self) -> None:
+        c = self.canvas
+        c.delete("all")
+        w, h = c.winfo_width() or self.sw, c.winfo_height() or self.sh
+        img = self.cache.get(self.index)
+        if img is None:
+            c.create_text(w // 2, h // 2, text="Chargement…", fill="#888888", font=self.app.font_big)
+        elif isinstance(img, str):
+            c.create_text(w // 2, h // 2, text=f"Image indisponible\n{img}", fill="#cc6666", font=self.app.font_big,
+                          justify="center")
+        else:
+            self._tk = ImageTk.PhotoImage(img)
+            c.create_image(w // 2, h // 2, image=self._tk)
+        if self.show_info and self.photos:
+            p = self.photos[self.index]
+            info = f"{p.label}   ·   {self.index + 1} / {len(self.photos)}"
+            if p.date is not None:
+                info += f"   ·   {format_date(p.date)}"
+            c.create_text(24, h - 24, text=info, anchor="sw", fill="#DDDDDD", font=self.app.font)
+            c.create_text(w - 24, h - 24, anchor="se", fill="#777777", font=self.app.font_small,
+                          text=f"{'▶' if self.playing else '❚❚'} {self.interval} s · Espace pause · ←/→ · +/- "
+                               f"intervalle · I infos · L boucle{' (activée)' if self.loop else ''} · Échap")
+        if self._message:
+            c.create_text(w // 2, 60, text=self._message, fill="#FFFFFF", font=self.app.font_title)
+
+    def close(self) -> None:
+        if self._timer:
+            self.win.after_cancel(self._timer)
+        self.cache.clear()
+        self.win.destroy()
+
+
 class MainWindow:
     """Fenêtre principale : arborescence, grille de vignettes, recherche."""
 
@@ -4185,11 +5792,32 @@ class MainWindow:
         self._tag_names: list[str] = []
         self._tree_silent = False
 
+        # iphotor 2
+        self.selection: dict[str, Photo] = {}
+        self._sel_anchor: Optional[int] = None
+        self.adv_criteria: Optional[dict] = None
+        self._adv_views: dict = {}
+        self._adv_dialog = None
+        self.collections = vcoll.Collections(protected=self._protected_roots)
+        self.coll_browser: Optional[CollectionBrowser] = None
+        self.current_valbum: Optional[int] = None
+        self._timeline = None
+        self._timeline_key = None
+        self._tl_unknown: list[int] = []
+        self._tl_stack: list = []
+        self.periods: list = []
+        self._stats_cache: dict = {}
+        self._disk_ok: Optional[bool] = None
+        self._watch_count = 0
+        self._watch_busy = False
+        self._folder_sig: Optional[dict] = None
+
         self._setup_style()
         self._build_ui()
         self._update_title()
         self.root.after(30, self._poll_thumbnails)
         self.root.after(100, lambda: self.start(force_reindex))
+        self.root.after(5000, self._watch_tick)
 
     # -- style ---------------------------------------------------------------
     def _setup_style(self) -> None:
@@ -4232,9 +5860,14 @@ class MainWindow:
         def build():
             c = COLORS
             dark = self.settings.theme == "dark"
-            border = {"normal": c["card_border"], "hover": c["card_hover_border"], "current": c["accent"]}[state]
-            shadow = None if dark else (c["shadow"], 26 if state == "normal" else 46, 3 if state == "normal" else 5)
-            return rounded_image(TILE_W, TILE_H, 10, c["card"], border, 2 if state == "current" else 1,
+            base = state.replace("sel_", "")
+            border = {"normal": c["card_border"], "hover": c["card_hover_border"], "current": c["accent"]}[base]
+            selected = state.startswith("sel_")
+            fill = c["accent_soft"] if selected else c["card"]
+            if selected:
+                border = c["accent"]
+            shadow = None if dark else (c["shadow"], 26 if base == "normal" else 46, 3 if base == "normal" else 5)
+            return rounded_image(TILE_W, TILE_H, 10, fill, border, 2 if (base == "current" or selected) else 1,
                                  bg=c["bg"], shadow=shadow, inset=5)
         return self._custom(f"card:{state}", build)
 
@@ -4256,6 +5889,14 @@ class MainWindow:
             img.alpha_composite(ic, (6, 6))
             return img
         return self._custom(f"badge:{icon}:{role}", build)
+
+    def badge_check(self):
+        """Pastille bleue cochée (photo sélectionnée)."""
+        def build():
+            img = rounded_image(26, 26, 13, COLORS["accent_fill"], "#FFFFFF", 2, shadow=("#000000", 60, 1.5), inset=2)
+            img.alpha_composite(draw_icon("check", 14, "#FFFFFF"), (6, 6))
+            return img
+        return self._custom("badge:check", build)
 
     def overlay_button(self, icon: str):
         def build():
@@ -4346,7 +5987,7 @@ class MainWindow:
             pass
 
     def _configure_tree_tags(self) -> None:
-        for t in (self.tree, self.ftree):
+        for t in (self.tree, self.ftree, getattr(self, "ctree", self.tree)):
             t.tag_configure("section", font=self.font_bold, foreground=COLORS["text"])
             t.tag_configure("empty", foreground=COLORS["faint"])
             t.tag_configure("folder", foreground=COLORS["text"])
@@ -4383,6 +6024,11 @@ class MainWindow:
         self._rebuild_recent_menu()
         m_file.add_command(label="Ouvrir un dossier…", command=self.open_folder_dialog,
                            accelerator="Ctrl+Maj+O")
+        self.m_recent_folders = tk.Menu(m_file, tearoff=False)
+        m_file.add_cascade(label="Dossiers récents", menu=self.m_recent_folders)
+        self.m_fav_folders = tk.Menu(m_file, tearoff=False)
+        m_file.add_cascade(label="Dossiers favoris", menu=self.m_fav_folders)
+        self._rebuild_folder_menus()
         m_file.add_separator()
         m_file.add_command(label="Copier l'élément sélectionné vers un dossier…",
                            command=self.copy_selected_tree_item, accelerator="Ctrl+Maj+S")
@@ -4392,16 +6038,48 @@ class MainWindow:
         m_file.add_separator()
         m_file.add_command(label="Vider le cache des miniatures", command=self.clear_thumb_cache)
         m_file.add_command(label="Informations sur le cache", command=self.show_cache_info)
+        m_file.add_command(label="Nettoyer les caches obsolètes…", command=self.clean_obsolete_caches)
         m_file.add_separator()
         m_file.add_command(label="Quitter", command=self.quit, accelerator="Ctrl+Q")
         menubar.add_cascade(label="Fichier", menu=m_file)
+        m_edit = tk.Menu(menubar, tearoff=False)
+        m_edit.add_command(label="Sélectionner la page", command=self.select_page, accelerator="Ctrl+A")
+        m_edit.add_command(label="Sélectionner toute la vue", command=self.select_view)
+        m_edit.add_command(label="Inverser la sélection de la page", command=self.invert_page_selection)
+        m_edit.add_command(label="Tout désélectionner", command=self.clear_selection, accelerator="Échap")
+        m_edit.add_separator()
+        m_edit.add_command(label="Ajouter la sélection à un album virtuel…", command=self.add_to_virtual_album)
+        m_edit.add_command(label="Propriétés de la sélection", command=self.batch_properties)
+        menubar.add_cascade(label="Édition", menu=m_edit)
         m_view = tk.Menu(menubar, tearoff=False)
         self.theme_var = tk.BooleanVar(value=self.settings.theme == "dark")
         m_view.add_checkbutton(label="Thème sombre", variable=self.theme_var,
                                command=lambda: self.set_theme("dark" if self.theme_var.get() else "light"))
+        m_view.add_separator()
+        m_view.add_command(label="Chronologie", command=lambda: self._select_tree_entry("timeline"))
+        self.watch_var = tk.BooleanVar(value=self.settings.folder_watch)
+        m_view.add_checkbutton(label="Surveiller le dossier ouvert (toutes les 30 s)", variable=self.watch_var,
+                               command=self.toggle_folder_watch)
         menubar.add_cascade(label="Affichage", menu=m_view)
+        m_tools = tk.Menu(menubar, tearoff=False)
+        m_tools.add_command(label="Recherche avancée…", command=self.open_advanced_search, accelerator="Ctrl+Maj+F")
+        m_tools.add_command(label="Carte des photos géolocalisées", command=self.open_map)
+        m_tools.add_command(label="Statistiques", command=self.open_stats)
+        m_tools.add_separator()
+        m_tools.add_command(label="Rechercher les doublons…", command=self.find_duplicates)
+        m_tools.add_command(label="Derniers résultats de doublons", command=self.open_last_duplicates)
+        m_tools.add_command(label="Comparer les deux photos sélectionnées", command=self.compare_selection)
+        m_tools.add_separator()
+        m_tools.add_command(label="Diaporama", command=self.start_slideshow)
+        m_tools.add_command(label="Exporter les métadonnées (CSV, JSON)…", command=lambda: ExportDialog(self, self.root))
+        m_tools.add_command(label="Nouvel album virtuel…", command=self.new_valbum)
+        m_tools.add_separator()
+        m_tools.add_command(label="Analyser les métadonnées (EXIF, GPS)…", command=self.analyze_metadata)
+        m_tools.add_command(label="Importer mots-clés, personnes et lieux Apple…", command=self.import_apple_terms)
+        menubar.add_cascade(label="Outils", menu=m_tools)
         m_help = tk.Menu(menubar, tearoff=False)
         m_help.add_command(label="Raccourcis clavier", command=self.show_shortcuts)
+        m_help.add_command(label="Diagnostic", command=self.show_diagnostic)
         m_help.add_command(label="À propos", command=self.show_about)
         menubar.add_cascade(label="Aide", menu=m_help)
         root.config(menu=menubar)
@@ -4415,6 +6093,9 @@ class MainWindow:
                             ("<KeyPress-f>", "fav"), ("<KeyPress-t>", "tags"), ("<KeyPress-i>", "exif")):
             root.bind(seq, lambda e, a=action: self._grid_shortcut(a))
         root.bind_all("<Control-f>", lambda e: self.search_entry.focus_set())
+        root.bind_all("<Control-F>", lambda e: self.open_advanced_search())
+        root.bind("<Control-a>", lambda e: self.select_page())
+        root.bind("<Escape>", self.clear_selection)
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
         # ---- Barre supérieure : identité, mode, ouverture, recherche --------------------
@@ -4433,7 +6114,8 @@ class MainWindow:
         seg.pack(side="left", padx=(SPACE_XL, 0))
         self.mode_buttons = {}
         for mode, label, short, icon in ((MODE_LIBRARY, "Bibliothèque iPhoto", "Bibliothèque", "library"),
-                                         (MODE_FOLDER, "Explorer un dossier", "Dossier", "folder_open")):
+                                         (MODE_FOLDER, "Explorer un dossier", "Dossier", "folder_open"),
+                                         (MODE_COLLECTIONS, "Collections", "Collections", "album")):
             b = ttk.Radiobutton(seg, text=label, value=mode, variable=self.mode_var, image=ic.get(icon, 16),
                                 compound="left", style="Segment.Toolbutton",
                                 command=lambda: self.set_mode(self.mode_var.get()))
@@ -4495,6 +6177,8 @@ class MainWindow:
                        style="StatusIcon.TLabel", padding=(SPACE_S, 4))
         ro.pack(side="right")
         Tooltip(ro, "Les bibliothèques et les dossiers consultés ne sont jamais modifiés.")
+        self.sel_label = ttk.Label(status_bar, text="", style="Status.TLabel", padding=(SPACE_M, 4))
+        self.sel_label.pack(side="right")
         status = ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel", anchor="w",
                            padding=(0, 5))
         status.pack(side="left", fill="x", expand=True)
@@ -4537,7 +6221,18 @@ class MainWindow:
         fsb.pack(side="right", fill="y")
         self.ftree.bind("<<TreeviewSelect>>", self._on_ftree_select)
         self.ftree.bind("<Button-3>", lambda e: self._on_tree_menu(e, self.ftree))
-        for t in (self.tree, self.ftree):
+        self.ctree_frame = ttk.Frame(left_pane, style="Panel.TFrame")
+        self.ctree = ttk.Treeview(self.ctree_frame, columns=("n",), show="tree", selectmode="browse",
+                                  style="Sidebar.Treeview")
+        self.ctree.column("#0", width=200, stretch=True)
+        self.ctree.column("n", width=56, anchor="e", stretch=False)
+        csb = ttk.Scrollbar(self.ctree_frame, orient="vertical", command=self.ctree.yview)
+        self.ctree.configure(yscrollcommand=csb.set)
+        self.ctree.pack(side="left", fill="both", expand=True)
+        csb.pack(side="right", fill="y")
+        self.ctree.bind("<<TreeviewSelect>>", self._on_ctree_select)
+        self.ctree.bind("<Button-3>", lambda e: self.valbum_menu(self.ctree.identify_row(e.y), e.x_root, e.y_root))
+        for t in (self.tree, self.ftree, self.ctree):
             t.bind("<Motion>", lambda e, tr=t: self._tree_hover(tr, e), add="+")
             t.bind("<Leave>", lambda e, tr=t: self._tree_unhover(tr), add="+")
             t.bind("<<TreeviewSelect>>", lambda e, tr=t: self._tree_unhover(tr), add="+")
@@ -4581,6 +6276,9 @@ class MainWindow:
         key, desc = self._sort_choice()
         self.folder.sort_key, self.folder.sort_desc = key, desc
 
+        self.btn_back = ttk.Button(header, text="Retour", compound="left", style="TButton",
+                                   image=ic.get("chev_left", 16, "text"), command=self.timeline_back)
+        Tooltip(self.btn_back, "Revenir au niveau précédent de la chronologie")
         left = ttk.Frame(header, style="Header.TFrame")
         left.pack(side="left", fill="x", expand=True)
         self.header_left = left
@@ -4588,6 +6286,47 @@ class MainWindow:
         self.title_label.pack(anchor="w")
         self.subtitle_label = ttk.Label(left, text="", style="Subheading.TLabel")
         self.subtitle_label.pack(anchor="w", pady=(2, 0))
+
+        # Barre d'actions contextuelle (sélection multiple)
+        self.selbar = ttk.Frame(content, style="Header.TFrame", padding=(SPACE_XL, 0, SPACE_L, SPACE_S))
+        sb_inner = ttk.Frame(self.selbar, style="Panel.TFrame", padding=(SPACE_M, 3, 4, 3))
+        sb_inner.pack(fill="x")
+        ttk.Label(sb_inner, image=ic.get("check", 16, "accent"), style="Panel.TLabel").pack(side="left")
+        self.selbar_count = ttk.Label(sb_inner, text="", style="Strong.TLabel")
+        self.selbar_count.pack(side="left", padx=(SPACE_XS, SPACE_M))
+
+        self._selbar_buttons: list = []
+
+        def sbtn(text, icon, cmd, tip, role="secondary"):
+            b = ttk.Button(sb_inner, text=text, image=ic.get(icon, 16, role), compound="left" if text else "image",
+                           style="Ghost.TButton" if text else "Icon.TButton", command=cmd)
+            b.pack(side="left", padx=(2, 0))
+            Tooltip(b, tip)
+            if text:
+                self._selbar_buttons.append(b)
+            return b
+        sbtn("Favoris", "heart_fill", lambda: self.batch_favorite(True), "Ajouter la sélection aux favoris", "favorite")
+        sbtn("", "heart", lambda: self.batch_favorite(False), "Retirer la sélection des favoris")
+        sbtn("Tag", "tag", self.batch_add_tags, "Ajouter un ou plusieurs tags")
+        sbtn("", "close", self.batch_remove_tag, "Retirer un tag de la sélection")
+        sbtn("Album virtuel", "album", self.add_to_virtual_album, "Ajouter à un album virtuel (références)")
+        sbtn("Copier vers…", "folder_arrow", self.batch_copy, "Copier les fichiers vers un dossier")
+        sbtn("Exporter", "file", lambda: ExportDialog(self, self.root, "selection"), "Exporter les métadonnées")
+        sbtn("Infos", "info", self.batch_properties, "Propriétés communes de la sélection")
+        self.btn_sel_compare = sbtn("Comparer", "library", self.compare_selection, "Comparer deux photos")
+        sbtn("Diaporama", "play", lambda: self.start_slideshow("selection"), "Diaporama de la sélection")
+        self.btn_sel_up = ttk.Button(sb_inner, image=ic.get("chev_left", 16), style="Icon.TButton",
+                                     command=lambda: self.valbum_move_selection(-1))
+        Tooltip(self.btn_sel_up, "Avancer dans l'album virtuel")
+        self.btn_sel_down = ttk.Button(sb_inner, image=ic.get("chev_right", 16), style="Icon.TButton",
+                                       command=lambda: self.valbum_move_selection(1))
+        Tooltip(self.btn_sel_down, "Reculer dans l'album virtuel")
+        self.btn_sel_remove = ttk.Button(sb_inner, text="Retirer de l'album", style="Ghost.TButton",
+                                         command=self.valbum_remove_selection)
+        clear = ttk.Button(sb_inner, image=ic.get("close", 14, "muted"), style="Icon.TButton",
+                           command=self.clear_selection)
+        clear.pack(side="right")
+        Tooltip(clear, "Tout désélectionner (Échap)")
 
         grid_frame = ttk.Frame(content, style="Bg.TFrame")
         grid_frame.pack(side="top", fill="both", expand=True)
@@ -4644,6 +6383,9 @@ class MainWindow:
         self.scope.configure(width=19 if level < 2 else 14)
         self.btn_search.configure(compound="none" if level < 2 else "image",
                                   style="Accent.TButton" if level < 2 else "AccentIcon.TButton")
+        for b in getattr(self, "_selbar_buttons", []):
+            b.configure(compound="left" if level == 0 else "image",
+                        style="Ghost.TButton" if level == 0 else "Icon.TButton")
         for b, txt in ((self.btn_prev, "Précédent"), (self.btn_next, "Suivant")):
             b.configure(text=txt if level < 2 else "", compound=("left" if b is self.btn_prev else "right")
                         if level < 2 else "image")
@@ -4654,13 +6396,15 @@ class MainWindow:
     # -- choix de la bibliothèque -----------------------------------------------
     def _update_title(self) -> None:
         name = os.path.basename(self.library.root) or self.library.root
+        if self.mode == MODE_COLLECTIONS:
+            name = "Collections"
         if self.mode == MODE_FOLDER and not name:
             name = "Explorer un dossier"
         name = safe_text(name)
         self.root.title(f"{name} — iphotor {APP_VERSION}")
         if hasattr(self, "sidebar_caption"):
-            caption = "DOSSIER" if self.mode == MODE_FOLDER else "PHOTOTHÈQUE"
-            if name and name != "Explorer un dossier":
+            caption = {MODE_FOLDER: "DOSSIER", MODE_COLLECTIONS: "COLLECTIONS"}.get(self.mode, "PHOTOTHÈQUE")
+            if name and name not in ("Explorer un dossier", "Collections"):
                 caption += "  ·  " + re.sub(r"\.photo(s)?library$", "", name).upper()
             self.sidebar_caption.config(text=caption)
 
@@ -4710,6 +6454,10 @@ class MainWindow:
         self.cache = cache
         self.loader = ThumbnailLoader(library, cache)
         self.settings.remember(path)
+        self.clear_selection()
+        self._timeline = None
+        self._disk_ok = None
+        self._adv_views = {}
         self._rebuild_recent_menu()
         self._update_title()
         self.search_var.set("")
@@ -4720,7 +6468,23 @@ class MainWindow:
     # -- modes : bibliothèque iPhoto / explorer un dossier ---------------------------
     # Attributs propres à chaque mode, sauvegardés et restaurés lors d'un changement de mode.
     _MODE_ATTRS = ("library", "cache", "loader", "photos", "view", "total", "page_no",
-                   "view_ids", "current_album_id", "_annot_sel", "_tag_names")
+                   "view_ids", "current_album_id", "_annot_sel", "_tag_names", "_tl_stack", "_adv_views")
+
+    def _initial_collections_state(self) -> dict:
+        lib = CollectionLibrary(self._protected_roots)
+        cache = FolderThumbCache(lib)
+        return {
+            "library": lib, "cache": cache, "loader": ThumbnailLoader(lib, cache),
+            "photos": None, "view": View("empty", title="Albums virtuels"), "total": 0,
+            "page_no": 0, "view_ids": None, "current_album_id": None, "search": "",
+            "_annot_sel": None, "_tag_names": [], "_tl_stack": [], "_adv_views": {},
+            "title": "Collections", "subtitle": "Albums virtuels : des photos de plusieurs sources, sans copie",
+            "status": "", "yview": 0.0,
+            "grid_msg": ("Les albums virtuels regroupent des photos de plusieurs bibliothèques et dossiers,\n"
+                         "sans copier ni déplacer les fichiers.\n\nSélectionnez des photos (Ctrl+clic) dans une "
+                         "bibliothèque ou un dossier,\npuis « Album virtuel » dans la barre de sélection.",
+                         COLORS["muted"]),
+        }
 
     def _initial_folder_state(self) -> dict:
         lib = FolderLibrary("")
@@ -4729,7 +6493,7 @@ class MainWindow:
             "library": lib, "cache": cache, "loader": ThumbnailLoader(lib, cache),
             "photos": None, "view": View("empty", title="Explorer un dossier"), "total": 0,
             "page_no": 0, "view_ids": None, "current_album_id": None, "search": "",
-            "_annot_sel": None, "_tag_names": [],
+            "_annot_sel": None, "_tag_names": [], "_tl_stack": [], "_adv_views": {},
             "title": "Explorer un dossier", "subtitle": "Aucun dossier ouvert", "status": "",
             "yview": 0.0,
             "grid_msg": ("Cliquez sur « Ouvrir un dossier… » pour afficher les images d'un dossier\n"
@@ -4749,6 +6513,7 @@ class MainWindow:
                                 parent=self.root)
             self.mode_var.set(self.mode)
             return
+        self.clear_selection()
         state = {a: getattr(self, a) for a in self._MODE_ATTRS}
         state.update(search=self.search_var.get(), title=self.title_label.cget("text"),
                      subtitle=self.subtitle_label.cget("text"), status=self.status_var.get(),
@@ -4762,7 +6527,8 @@ class MainWindow:
 
         self.mode = mode
         self.mode_var.set(mode)
-        new = self._mode_states.get(mode) or self._initial_folder_state()
+        new = self._mode_states.get(mode) or (self._initial_collections_state() if mode == MODE_COLLECTIONS
+                                              else self._initial_folder_state())
         for a in self._MODE_ATTRS:
             setattr(self, a, new[a])
         self.search_var.set(new["search"])
@@ -4789,14 +6555,22 @@ class MainWindow:
 
     def _apply_mode_widgets(self) -> None:
         level = getattr(self, "_compact_level", 0) or 0
+        for fr in (self.tree_frame, self.ftree_frame, self.ctree_frame):
+            fr.pack_forget()
+        if self.btn_back.winfo_ismapped():
+            self.btn_back.pack_forget()
         if self.mode == MODE_FOLDER:
-            self.tree_frame.pack_forget()
             self.ftree_frame.pack(fill="both", expand=True)
             self.scope.pack_forget()
             self.folder_opts.pack(side="top", fill="x", before=self.grid_frame)
             self.search_entry.configure(width={0: 28, 1: 22, 2: 16}[level] + 6)
+        elif self.mode == MODE_COLLECTIONS:
+            self.ctree_frame.pack(fill="both", expand=True)
+            self.scope.pack_forget()
+            self.folder_opts.pack_forget()
+            self.search_entry.configure(width={0: 28, 1: 22, 2: 16}[level] + 6)
+            self._populate_ctree()
         else:
-            self.ftree_frame.pack_forget()
             self.tree_frame.pack(fill="both", expand=True)
             self.folder_opts.pack_forget()
             self.scope.pack(side="left", padx=(SPACE_S, 0), before=self.btn_search)
@@ -4879,7 +6653,10 @@ class MainWindow:
         recursive = bool(self.recursive_var.get())
         self.settings.last_folder = path
         self.settings.folder_recursive = recursive
+        self.settings.recent_folders = folderlib.remember(self.settings.recent_folders, path)
         self.settings.save()
+        self._rebuild_folder_menus()
+        self.clear_selection()
 
         scanner = FolderScanner(path, recursive)
         self._scanner = scanner
@@ -4956,6 +6733,10 @@ class MainWindow:
             summary += f"   ·   ⚠ {plural(scanner.unreadable, 'fichier illisible', 'fichiers illisibles')}"
         if not self.cache.usable():
             summary += "   ·   miniatures non mises en cache (le cache se trouve dans ce dossier)"
+        changes = self._folder_snapshot(scanner)
+        if changes:
+            summary += f"   ·   {changes}"
+        self._timeline = None
         if active:
             self.photos = self.folder
             self.set_view(self._folder_view())
@@ -5018,13 +6799,18 @@ class MainWindow:
             rel, reason = self.folder.errors[int(iid[4:])]
             self._set_status(f"⚠ Dossier inaccessible : {safe_text(rel)} — {reason}")
             return
+        if self._v2_tree_select(self.ftree, iid):
+            return
         if iid == "fav" or iid.startswith("tag:"):
+            self.folder.date_range = None
             self._show_annotation_view("fav" if iid == "fav" else ("tag", self._tag_names[int(iid[4:])]))
+            self._update_back()
             return
         if iid == "sec:tags":
             self.ftree.item(iid, open=True)
             return
         self._annot_sel = None
+        self.folder.date_range = None
         self.folder.only = None
         self.folder.subdir = iid[2:] or None
         self.folder.refresh()
@@ -5038,6 +6824,8 @@ class MainWindow:
         if f.only is not None:
             title = f"Recherche « {f.query} » dans {f.only_title}" if f.query else f.only_title
             return View("folder", query=f.query, title=safe_text(title))
+        if f.date_range is not None:
+            return View("folder", query=f.query, title=getattr(f, "range_title", "Chronologie"))
         title = f"Recherche « {f.query} » dans {name}" if f.query else f"Dossier : {name}"
         return View("folder", query=f.query, title=safe_text(title))
 
@@ -5181,6 +6969,8 @@ class MainWindow:
                                     "Utilisez « Fichier › Reconstruire l'index ».", COLORS["missing"])
             return
         self._populate_tree()
+        self._disk_ok = self.library.is_available()
+        self._attach_meta()
         self.tree.selection_set("all")
         self.tree.focus("all")
         if not self.status_var.get():
@@ -5287,6 +7077,44 @@ class MainWindow:
                 return None
         return None
 
+    def _v2_tree_select(self, tree, iid: str) -> bool:
+        """Entrées ajoutées par iphotor 2 (chronologie, résultats, albums intelligents, recherches)."""
+        handled = True
+        if iid == "timeline":
+            self.show_timeline("years", push=False)
+        elif iid == "adv":
+            v = self._adv_views.get("adv")
+            if isinstance(v, View):
+                self.set_view(v)
+            elif v:
+                f = self.folder
+                f.subdir, f.date_range = None, None
+                f.only, f.only_title = set(v[1]), v[2]
+                f.refresh()
+                self.photos = f
+                self.set_view(self._folder_view())
+        elif iid.startswith("smart:"):
+            self.open_smart(int(iid[6:]))
+        elif iid.startswith("saved:"):
+            self.open_saved_search(int(iid[6:]))
+        elif iid in ("sec:smart", "sec:saved"):
+            tree.item(iid, open=True)
+        else:
+            handled = False
+        if handled or self._tl_stack:
+            if not handled:
+                self._tl_stack = []
+            self._update_back()
+        return handled
+
+    def _select_tree_entry(self, iid: str) -> None:
+        if self.mode == MODE_COLLECTIONS:
+            self.set_mode(MODE_LIBRARY)
+        t = self.ftree if self.mode == MODE_FOLDER else self.tree
+        if t.exists(iid):
+            t.selection_set(iid)
+            t.see(iid)
+
     def _on_tree_click(self, event) -> None:
         """Un clic sur le libellé d'une rubrique (Albums, Événements…) la déplie ou la replie."""
         iid = self.tree.identify_row(event.y)
@@ -5303,9 +7131,12 @@ class MainWindow:
         if not sel:
             return
         iid = sel[0]
+        if self._v2_tree_select(self.tree, iid):
+            return
         if iid == "fav" or iid.startswith("tag:"):
             self._show_annotation_view("fav" if iid == "fav" else ("tag", self._tag_names[int(iid[4:])]))
             self._set_status(self.tree.item(iid, "text").strip())
+            self._update_back()
             return
         self._annot_sel = None
         album_id = self._album_from_iid(iid)
@@ -5345,7 +7176,11 @@ class MainWindow:
         self.view_ids = None
         self.page_no = 0
         try:
-            self.total = self.photos.count(view) if (self.photos and view.kind != "empty") else 0
+            if view.kind == "timeline":
+                self.periods = self._timeline_periods()
+                self.total = len(self.periods)
+            else:
+                self.total = self.photos.count(view) if (self.photos and view.kind != "empty") else 0
         except sqlite3.Error as exc:
             self.total = 0
             message = f"Erreur de lecture de l'index : {exc}"
@@ -5353,6 +7188,21 @@ class MainWindow:
         sub = plural(self.total, "photo") if view.kind != "empty" else ""
         if view.kind == "folder":
             sub = self._folder_subtitle()
+        if view.kind == "ids" and view.query:
+            sub += f"   ·   {view.query}"
+        if view.kind == "valbum" and self.coll_browser is not None:
+            miss = self.coll_browser.missing
+            sub = plural(self.total, "photo") + (f"   ·   {miss} introuvable(s) — clic droit sur l'album › Retrouver"
+                                                  if miss else "") + "   ·   références seulement, fichiers intacts"
+        if view.kind == "timeline":
+            t = self._timeline_data()
+            n = sum(p.count for p in self.periods if p.level not in ("gap",))
+            sub = plural(n, "photo")
+            rich = t.richest_days(3)
+            if rich and view.level == "years":
+                sub += "   ·   jours les plus riches : " + ", ".join(f"{p.label} ({p.count})" for p in rich)
+            if t.unknown and view.level == "years":
+                sub += f"   ·   {t.unknown} sans date exploitable"
         if view.kind == "album" and self.albums:
             a = self.albums.get(view.album_id)
             if a:
@@ -5363,6 +7213,8 @@ class MainWindow:
                     sub += f"   ·   {format_date(a.date, with_time=False)}"
         self.subtitle_label.config(text=sub)
         self.load_page(message=message)
+        if hasattr(self, "btn_back"):
+            self._update_back()
 
     def page_count(self) -> int:
         return max(1, (self.total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -5401,6 +7253,13 @@ class MainWindow:
                     message = f"Aucune photo ne correspond à « {self.view.query} »."
                 elif self.view.kind == "album":
                     message = "Cet album ne contient aucune photo."
+                elif self.view.kind == "valbum":
+                    message = ("Cet album virtuel est vide.\nSélectionnez des photos dans une bibliothèque ou un "
+                               "dossier, puis « Album virtuel » dans la barre de sélection.")
+                elif self.view.kind == "timeline":
+                    message = "Aucune photo datée."
+                elif self.view.kind == "ids":
+                    message = "Aucune photo ne correspond à ces critères."
                 elif self.view.kind == "folder":
                     if self.folder.query:
                         message = f"Aucune image dont le nom contient « {self.folder.query} »."
@@ -5409,6 +7268,15 @@ class MainWindow:
                                    + ("" if self.folder.recursive else
                                       "\nCochez « Inclure les sous-dossiers » pour chercher plus loin."))
             self._show_grid_message(message)
+            return
+        if self.view.kind == "timeline":
+            self.page_photos = [self._timeline_photo(p.first_id) if p.count else None for p in self.periods]
+            self.canvas.yview_moveto(0)
+            self._layout()
+            gen = self.generation
+            for i, p in enumerate(self.page_photos):
+                if p is not None:
+                    self.loader.request(gen, i, p)
             return
         try:
             self.page_photos = self.photos.page(self.view, self.page_no * PAGE_SIZE, PAGE_SIZE)
@@ -5437,7 +7305,10 @@ class MainWindow:
         if not self.page_photos:
             return
         for i, p in enumerate(self.page_photos):
-            self._draw_tile(i, p)
+            if self.view.kind == "timeline":
+                self._draw_period(i, self.periods[i])
+            else:
+                self._draw_tile(i, p)
         rows = (len(self.page_photos) + self._columns() - 1) // self._columns()
         self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), rows * TILE_H + 16))
 
@@ -5459,13 +7330,7 @@ class MainWindow:
         x, y = self._tile_origin(i)
         tag = f"t{i}"
         state = self.tile_images.get(i)
-        absolute = self.page_no * PAGE_SIZE + i
-        if self.current_index == absolute:
-            look = "current"
-        elif self.hover_index == i:
-            look = "hover"
-        else:
-            look = "normal"
+        look = self._tile_look(i)
         c.create_image(x, y, image=self.card_image(look), anchor="nw", tags=(tag, f"bg{i}"))
         # Zone de la miniature : carré neutre, photo centrée (proportions respectées)
         wx, wy = x + (TILE_W - THUMB_SIZE) // 2, y + 12
@@ -5501,6 +7366,8 @@ class MainWindow:
             c.create_image(bx1 - 6, by0 + 6, image=self.pill_image(w, 20), anchor="ne", tags=(tag,))
             c.create_text(bx1 - 6 - w // 2, by0 + 16, text=stars, fill=COLORS["star"], font=self.font_small,
                           tags=(tag,))
+        if self.selection and self.is_selected(p):
+            c.create_image(bx0 + 4, by1 - 4, image=self.badge_check(), anchor="sw", tags=(tag,))
         if self.is_favorite(p):
             c.create_image(bx1 - 4, by1 - 4, image=self.badge_image("heart_fill", "favorite"), anchor="se",
                            tags=(tag,))
@@ -5521,7 +7388,7 @@ class MainWindow:
         sub = format_date(p.date, with_time=False) if p.date is not None else ""
         if p.label != p.filename and p.filename:
             sub = (sub + "  ·  " if sub else "") + p.filename
-        if p.source == "folder":
+        if p.source == "folder" and p.size:
             sub = (sub + "  ·  " if sub else "") + format_size(p.size)
         c.create_text(x + 14, ty + 19, text=self._truncate(sub, self.font_small, text_w), anchor="nw",
                       fill=COLORS["muted"], font=self.font_small, tags=(tag,))
@@ -5529,7 +7396,11 @@ class MainWindow:
     def _redraw_tile(self, i: int) -> None:
         if 0 <= i < len(self.page_photos):
             self.canvas.delete(f"t{i}")
-            self._draw_tile(i, self.page_photos[i])
+            if self.view.kind == "timeline":
+                if i < len(self.periods):
+                    self._draw_period(i, self.periods[i])
+            else:
+                self._draw_tile(i, self.page_photos[i])
 
     def _show_grid_message(self, text: str, color: Optional[str] = None) -> None:
         color = color or COLORS["muted"]
@@ -5582,6 +7453,17 @@ class MainWindow:
             self.canvas.itemconfigure(f"bg{old}", image=self.card_image(self._tile_look(old)))
         if i is not None:
             self.canvas.itemconfigure(f"bg{i}", image=self.card_image(self._tile_look(i)))
+            if self.view.kind == "timeline":
+                per = self.periods[i] if i < len(self.periods) else None
+                if per is not None:
+                    hint = {"year": "clic : afficher les mois", "month": "clic : afficher les jours",
+                            "day": "clic : afficher les photos", "unknown": "clic : afficher ces photos"}.get(per.level, "")
+                    txt = per.label + ("" if per.level == "gap" else f"   ·   {plural(per.count, 'photo')}")
+                    if hint and per.count:
+                        txt += f"   ·   {hint}"
+                    self.status_var.set(txt)
+                self.canvas.configure(cursor="hand2" if per is not None and per.count else "")
+                return
             p = self.page_photos[i]
             if p.source == "folder":
                 parts = [safe_text(p.image_path), format_size(p.size)]
@@ -5610,8 +7492,13 @@ class MainWindow:
 
     def _tile_look(self, i: int) -> str:
         if self.current_index == self.page_no * PAGE_SIZE + i:
-            return "current"
-        return "hover" if self.hover_index == i else "normal"
+            look = "current"
+        else:
+            look = "hover" if self.hover_index == i else "normal"
+        if (self.selection and self.view.kind != "timeline" and 0 <= i < len(self.page_photos)
+                and self.page_photos[i] is not None and self.is_selected(self.page_photos[i])):
+            look = "sel_" + look
+        return look
 
     def _annotation_parts(self, p: Photo) -> list[str]:
         parts = ["♥ favori"] if self.is_favorite(p) else []
@@ -5627,6 +7514,17 @@ class MainWindow:
         i = self._index_at(event)
         if i is None:
             return
+        if self.view.kind == "timeline":
+            if i < len(self.periods):
+                self.open_period(self.periods[i])
+            return
+        if event.state & 0x0004:          # Ctrl+clic : (dé)sélectionner
+            self.toggle_select(i)
+            return
+        if event.state & 0x0001:          # Maj+clic : sélectionner une plage
+            self.select_range(i)
+            return
+        self._sel_anchor = self.page_no * PAGE_SIZE + i
         self.open_viewer(self.page_no * PAGE_SIZE + i)
 
     def _poll_thumbnails(self) -> None:
@@ -5647,7 +7545,7 @@ class MainWindow:
 
     # -- visionneuse -------------------------------------------------------------
     def open_viewer(self, absolute_index: int) -> None:
-        if self.photos is None:
+        if self.photos is None or self.view.kind == "timeline":
             return
         if self.view_ids is None:
             try:
@@ -5690,6 +7588,9 @@ class MainWindow:
         if self.mode == MODE_FOLDER:
             self._folder_search()
             return
+        if self.mode == MODE_COLLECTIONS:
+            self._collection_search()
+            return
         if self.photos is None:
             return
         q = self.search_var.get().strip()
@@ -5728,16 +7629,29 @@ class MainWindow:
         if self.mode == MODE_FOLDER:
             self._folder_search()
             return
+        if self.mode == MODE_COLLECTIONS:
+            self._collection_search()
+            return
         if self.tree.exists("search"):
             self.tree.delete("search")
             if self.tree.exists("all"):
                 self.tree.selection_set("all")
 
     # -- favoris et tags -----------------------------------------------------------
+    def _collection_search(self) -> None:
+        b = self.coll_browser
+        if b is None or self.view.kind != "valbum":
+            return
+        b.query = self.search_var.get().strip()
+        b.refresh()
+        self.set_view(self.view)
+
     def _scope(self) -> str:
-        return FILES_SCOPE if self.mode == MODE_FOLDER else library_scope(self.library.root)
+        return FILES_SCOPE if self.mode in (MODE_FOLDER, MODE_COLLECTIONS) else library_scope(self.library.root)
 
     def _key(self, p: Photo) -> tuple[str, str]:
+        if p.ref:
+            return p.ref
         return photo_scope_key(p, self.library.root)
 
     def is_favorite(self, p: Photo) -> bool:
@@ -5852,9 +7766,12 @@ class MainWindow:
             return
         sel = t.selection()
         was_open = t.exists("sec:tags") and t.item("sec:tags", "open")
-        for iid in ("fav", "sec:tags"):
+        for iid in ("timeline", "fav", "sec:tags"):
             if t.exists(iid):
                 t.delete(iid)
+        t.insert("", pos, iid="timeline", text=" Chronologie", values=("",), tags=("section",),
+                 image=self.icons.get("event", 16, "accent"))
+        pos += 1
         t.insert("", pos, iid="fav", text=" Mes favoris", values=(format_count(self._annotation_count(favs)),),
                  tags=("section",), image=self.icons.get("heart", 16, "favorite"))
         self._tag_names = tags
@@ -5872,7 +7789,8 @@ class MainWindow:
             target = f"tag:{tags.index(self._annot_sel[1])}"
         elif sel and t.exists(sel[0]) and sel[0] != "sec:tags" and not sel[0].startswith("tag:"):
             target = sel[0]
-        if target:
+        self.refresh_smart_entries()
+        if target and t.exists(target):
             self._select_silently(t, target)
 
     def _select_silently(self, tree, iid: str) -> None:
@@ -6051,6 +7969,12 @@ class MainWindow:
 
     def _copy_spec(self, iid: str) -> Optional[tuple[list[tuple[Photo, str]], str, str]]:
         """(photos avec leur sous-dossier relatif, description, nom du dossier à créer)."""
+        if iid == "adv" and self._adv_views.get("adv") is not None:
+            v = self._adv_views["adv"]
+            if isinstance(v, View):
+                return [(p, "") for p in self._photos_of_view(v)], "les résultats de la recherche", "Recherche"
+            return ([(p, "") for p in self.folder.photos if path_key(p.image_path) in v[1]],
+                    "les résultats de la recherche", "Recherche")
         if self.mode == MODE_FOLDER:
             f = self.folder
             if iid == "fav" or iid.startswith("tag:"):
@@ -6146,14 +8070,42 @@ class MainWindow:
         m.add_separator()
         m.add_command(label="  Informations EXIF…", command=lambda: self.show_exif(p, parent), accelerator="I",
                       image=ic.get("info", 16), compound="left")
+        if parent is self.root:
+            m.add_separator()
+            selected = self.is_selected(p)
+            m.add_command(label="  Retirer de la sélection" if selected else "  Ajouter à la sélection",
+                          accelerator="Ctrl+clic", image=ic.get("check", 16), compound="left",
+                          command=lambda: self._toggle_photo_selection(p))
+            many = len(self.selection) > 1 and selected
+            m.add_command(label=f"  Ajouter {'la sélection' if many else 'à un album virtuel'}…"
+                          if not many else f"  Ajouter les {len(self.selection)} photos à un album virtuel…",
+                          image=ic.get("album", 16), compound="left",
+                          command=lambda: self.add_to_virtual_album(self.selected_photos() if many else [p]))
+            if self.mode == MODE_COLLECTIONS and self.view.kind == "valbum" and p.ref:
+                m.add_command(label="  Retirer de l'album virtuel (le fichier reste intact)",
+                              command=lambda: self._valbum_remove_one(p))
         try:
             m.tk_popup(x, y)
         finally:
             m.grab_release()
 
+    def _toggle_photo_selection(self, p: Photo) -> None:
+        k = self.photo_key(p)
+        if k in self.selection:
+            del self.selection[k]
+        else:
+            self.selection[k] = p
+        self._selection_changed()
+
+    def _valbum_remove_one(self, p: Photo) -> None:
+        self.selection = {self.photo_key(p): p}
+        self.valbum_remove_selection()
+
     def _on_canvas_menu(self, event) -> None:
         i = self._index_at(event)
         if i is None:
+            return
+        if self.view.kind == "timeline":
             return
         self._set_hover(i)
         p = self.page_photos[i]
@@ -6161,7 +8113,8 @@ class MainWindow:
         self.photo_menu(p, self.root, event.x_root, event.y_root, lambda: self.open_viewer(absolute))
 
     def _hovered_photo(self) -> Optional[Photo]:
-        if self.hover_index is not None and self.hover_index < len(self.page_photos):
+        if (self.view.kind != "timeline" and self.hover_index is not None
+                and self.hover_index < len(self.page_photos)):
             return self.page_photos[self.hover_index]
         return None
 
@@ -6180,10 +8133,13 @@ class MainWindow:
         iid = tree.identify_row(event.y)
         if not iid:
             return
+        if iid.startswith("smart:") or iid.startswith("saved:"):
+            self.smart_menu(iid, event.x_root, event.y_root, tree)
+            return
         if self.mode == MODE_FOLDER:
-            ok = iid.startswith("f:") or iid == "fav" or iid.startswith("tag:")
+            ok = iid.startswith("f:") or iid in ("fav", "adv") or iid.startswith("tag:")
         else:
-            ok = (iid in ("all", "fav", "search") or iid.startswith("tag:") or iid.startswith("y:")
+            ok = (iid in ("all", "fav", "search", "adv") or iid.startswith("tag:") or iid.startswith("y:")
                   or self._album_from_iid(iid) is not None)
         if not ok:
             return
@@ -6219,6 +8175,1464 @@ class MainWindow:
         if self._annot_sel == ("tag", name):
             self._annot_sel = "fav"
         self._after_annotation_change()
+
+    # =====================================================================================
+    # iphotor 2 — sélection multiple, métadonnées, recherche avancée, chronologie,
+    # collections, outils d'analyse, dossiers, disques, diagnostic
+    # =====================================================================================
+
+    # -- clés --------------------------------------------------------------------------
+    def photo_key(self, p: Photo) -> str:
+        return "|".join(self._key(p))
+
+    def meta_key(self, p: Photo) -> str:
+        """Clé dans metadata.sqlite3 : GUID / « id:N » (bibliothèque) ou chemin (dossier, collections)."""
+        if self.mode == MODE_LIBRARY:
+            return self._key(p)[1]
+        return path_key(p.image_path)
+
+    def meta_path(self) -> str:
+        if self.mode == MODE_LIBRARY:
+            return os.path.join(self.cache.cache_dir, "metadata.sqlite3")
+        return os.path.join(FOLDER_CACHE_DIR, "metadata.sqlite3")
+
+    def meta_index(self) -> "mdlib.MetadataIndex":
+        return mdlib.MetadataIndex(self.meta_path(), self._protected_roots())
+
+    def search_dialect(self) -> str:
+        return advsearch.LIBRARY if self.mode == MODE_LIBRARY else advsearch.FOLDER
+
+    # -- sélection multiple ------------------------------------------------------------------
+    def _selection_changed(self) -> None:
+        n = len(self.selection)
+        self.sel_label.config(text=plural(n, "photo sélectionnée", "photos sélectionnées") if n else "")
+        if n:
+            self.selbar_count.config(text=plural(n, "photo sélectionnée", "photos sélectionnées"))
+            self.btn_sel_compare.state(["!disabled"] if n == 2 else ["disabled"])
+            in_valbum = self.mode == MODE_COLLECTIONS and self.view.kind == "valbum"
+            for b in (self.btn_sel_up, self.btn_sel_down, self.btn_sel_remove):
+                (b.pack if in_valbum else b.pack_forget)(**({"side": "left", "padx": (2, 0)} if in_valbum else {}))
+            if not self.selbar.winfo_ismapped():
+                self.selbar.pack(side="top", fill="x", before=self.grid_frame)
+        elif self.selbar.winfo_ismapped():
+            self.selbar.pack_forget()
+        if self.page_photos and self.view.kind != "timeline":
+            self._layout()
+
+    def is_selected(self, p: Photo) -> bool:
+        return self.photo_key(p) in self.selection
+
+    def toggle_select(self, i: int) -> None:
+        p = self.page_photos[i]
+        k = self.photo_key(p)
+        if k in self.selection:
+            del self.selection[k]
+        else:
+            self.selection[k] = p
+        self._sel_anchor = self.page_no * PAGE_SIZE + i
+        self._selection_changed()
+
+    def select_range(self, i: int) -> None:
+        """Maj+clic : sélectionne de l'ancre jusqu'à la vignette (sur plusieurs pages si besoin)."""
+        target = self.page_no * PAGE_SIZE + i
+        anchor = self._sel_anchor if self._sel_anchor is not None else target
+        lo, hi = min(anchor, target), max(anchor, target)
+        try:
+            photos = self.photos.page(self.view, lo, hi - lo + 1)
+        except sqlite3.Error as exc:
+            self._set_status(f"Sélection impossible : {exc}")
+            return
+        for p in photos:
+            self.selection[self.photo_key(p)] = p
+        self._selection_changed()
+
+    def select_page(self) -> None:
+        if self._focus_in_entry() or self.view.kind == "timeline":
+            return
+        for p in self.page_photos:
+            self.selection[self.photo_key(p)] = p
+        self._selection_changed()
+        self._set_status(f"{plural(len(self.page_photos), 'photo')} de la page ajoutée(s) à la sélection.")
+
+    def select_view(self) -> None:
+        if self.photos is None or self.view.kind in ("empty", "timeline"):
+            return
+        if self.total > 50000 and not messagebox.askyesno(
+                "Sélection", f"Sélectionner les {format_count(self.total)} photos de la vue ?", parent=self.root):
+            return
+        for p in self.photos.page(self.view, 0, self.total):
+            self.selection[self.photo_key(p)] = p
+        self._selection_changed()
+
+    def invert_page_selection(self) -> None:
+        for p in self.page_photos:
+            k = self.photo_key(p)
+            if k in self.selection:
+                del self.selection[k]
+            else:
+                self.selection[k] = p
+        self._selection_changed()
+
+    def clear_selection(self, _event=None) -> None:
+        if _event is not None and self._focus_in_entry():
+            return
+        if self.selection:
+            self.selection.clear()
+            self._sel_anchor = None
+            self._selection_changed()
+
+    def selected_photos(self) -> list[Photo]:
+        return list(self.selection.values())
+
+    # -- actions groupées --------------------------------------------------------------------
+    def batch_favorite(self, on: bool) -> None:
+        photos = self.selected_photos()
+        try:
+            for p in photos:
+                self.annotations.set_favorite(*self._key(p), on)
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc)
+            return
+        self._set_status(f"{plural(len(photos), 'photo')} {'ajoutée(s) aux' if on else 'retirée(s) des'} favoris.")
+        self._after_annotation_change()
+
+    def batch_add_tags(self) -> None:
+        photos = self.selected_photos()
+        if not photos:
+            return
+        d = TextDialog(self, self.root, "Ajouter des tags", f"Ajouter des tags à {plural(len(photos), 'photo')}",
+                       "Tags (séparés par des virgules)", icon="tag", ok_text="Ajouter")
+        if not d.result:
+            return
+        new = [t for t in (clean_tag(x) for x in d.result.split(",")) if t]
+        try:
+            for p in photos:
+                scope, key = self._key(p)
+                cur = self.annotations.tags_of(scope, key)
+                self.annotations.set_tags(scope, key, cur + [t for t in new if t not in cur])
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc)
+            return
+        self._set_status(f"Tags {', '.join(new)} ajoutés à {plural(len(photos), 'photo')}.")
+        self._after_annotation_change()
+
+    def batch_remove_tag(self) -> None:
+        photos = self.selected_photos()
+        present = sorted({t for p in photos for t in self.annotations.tags_of(*self._key(p))}, key=normalize_text)
+        if not present:
+            messagebox.showinfo("Retirer un tag", "Aucune photo sélectionnée ne porte de tag.", parent=self.root)
+            return
+        d = TextDialog(self, self.root, "Retirer un tag", "Retirer un tag de la sélection",
+                       f"Tag à retirer ({', '.join(present[:12])}{'…' if len(present) > 12 else ''})",
+                       present[0], icon="tag", ok_text="Retirer")
+        if not d.result:
+            return
+        name = clean_tag(d.result)
+        n = 0
+        try:
+            for p in photos:
+                scope, key = self._key(p)
+                cur = self.annotations.tags_of(scope, key)
+                if name in cur:
+                    self.annotations.set_tags(scope, key, [t for t in cur if t != name])
+                    n += 1
+        except (sqlite3.Error, OSError) as exc:
+            self._annotation_error(exc)
+            return
+        self._set_status(f"Tag « {name} » retiré de {plural(n, 'photo')}.")
+        self._after_annotation_change()
+
+    def batch_copy(self) -> None:
+        photos = self.selected_photos()
+        self._start_copy([(p, "") for p in photos], plural(len(photos), "photo sélectionnée", "photos sélectionnées"),
+                         plural(len(photos), "photo"), "")
+
+    def batch_properties(self) -> None:
+        photos = self.selected_photos()
+        if not photos:
+            return
+        keys = [self.meta_key(p) for p in photos]
+        metas = self.meta_records(keys)
+        dates = [p.date for p in photos if p.date is not None]
+        sizes = [m.get("file_size") for m in metas.values() if m.get("file_size")]
+        favs = sum(1 for p in photos if self.is_favorite(p))
+        tag_sets = [set(self.tags_of(p)) for p in photos]
+        common_tags = set.intersection(*tag_sets) if tag_sets else set()
+
+        def common(field):
+            vals = {metas[k].get(field) for k in keys if k in metas}
+            vals.discard(None)
+            vals.discard("")
+            if len(vals) == 1:
+                return str(vals.pop())
+            return "(varie)" if vals else "—"
+        rows = [("#", "Sélection"), ("Photos", format_count(len(photos))),
+                ("Vidéos", format_count(sum(1 for p in photos if p.is_video))),
+                ("Favoris", format_count(favs)),
+                ("Tags communs", ", ".join(sorted(common_tags, key=normalize_text)) or "—"),
+                ("Période", f"{format_date(min(dates), False)} → {format_date(max(dates), False)}" if dates else "—"),
+                ("Taille totale", (format_size(sum(sizes)) + (f" ({len(sizes)} fichiers connus)" if len(sizes) < len(photos)
+                                                             else "")) if sizes else "inconnue (métadonnées non analysées)"),
+                ("#", "Propriétés communes (métadonnées analysées)"),
+                ("Analysées", f"{len(metas)} / {len(photos)}"),
+                ("Fabricant", common("make")), ("Appareil", common("model")), ("Objectif", common("lens")),
+                ("ISO", common("iso")), ("Focale", common("focal")), ("Ouverture", common("aperture")),
+                ("Largeur", common("width")), ("Hauteur", common("height"))]
+        events = {p.event_name for p in photos if p.event_name}
+        if events:
+            rows.insert(6, ("Événements", ", ".join(sorted(events))[:200]))
+        InfoDialog(self, self.root, "Propriétés", "Propriétés de la sélection", plural(len(photos), "photo"), rows)
+
+    def add_to_virtual_album(self, photos: Optional[list] = None) -> None:
+        photos = photos if photos is not None else self.selected_photos()
+        if not photos:
+            return
+        d = AlbumChooserDialog(self, self.root, len(photos))
+        if d.result is None:
+            return
+        refs = [self.photo_ref(p) for p in photos]
+        try:
+            n = self.collections.add(d.result, refs)
+        except (sqlite3.Error, OSError) as exc:
+            messagebox.showerror("Album virtuel", str(exc), parent=self.root)
+            return
+        a = self.collections.get(d.result)
+        self._set_status(f"{plural(n, 'photo ajoutée', 'photos ajoutées')} à l'album virtuel « {a.name if a else ''} »"
+                         + (f" ({len(refs) - n} déjà présente(s))" if n < len(refs) else "") + ".")
+        if self.mode == MODE_COLLECTIONS:
+            self._populate_ctree()
+
+    def photo_ref(self, p: Photo) -> dict:
+        scope, key = self._key(p)
+        path = self.source_file(p) or self.library.to_linux(p.image_path) or p.image_path
+        try:
+            size = os.path.getsize(path)
+        except (OSError, ValueError):
+            size = p.size
+        return {"scope": scope, "key": key, "path": path, "filename": p.filename, "size": size, "date": p.date}
+
+    # -- index des métadonnées ------------------------------------------------------------
+    def _metadata_items(self):
+        """(itérateur à exécuter dans un thread, total) pour la source courante."""
+        if self.mode == MODE_LIBRARY:
+            index_path, lib = self.cache.index_path, self.library
+            total = self.total_photos()
+
+            def gen():
+                con = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+                con.row_factory = sqlite3.Row
+                try:
+                    for r in mdlib.iter_rows(con, f"SELECT {PhotoManager.COLUMNS} FROM photos p ORDER BY p.id"):
+                        ph = PhotoManager._photo(r)
+                        yield (ph.guid or f"id:{ph.id}", ph.id, (lambda ph=ph: resolve_photo_file(lib, ph, True)))
+                finally:
+                    con.close()
+            return gen(), total
+        photos = list(self.photos.photos) if self.photos is not None and hasattr(self.photos, "photos") else []
+        return ((path_key(p.image_path), p.id, (lambda p=p: p.image_path if os.path.isfile(p.image_path) else None))
+                for p in photos), len(photos)
+
+    def total_photos(self) -> int:
+        if self.mode == MODE_LIBRARY:
+            if self.con is None:
+                return 0
+            return self.con.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+        return len(self.photos.photos) if self.photos is not None and hasattr(self.photos, "photos") else 0
+
+    def metadata_coverage(self) -> tuple[int, int, int]:
+        """(photos de la source, photos analysées, dont avec EXIF)."""
+        total = self.total_photos()
+        if not total or not os.path.isfile(self.meta_path()):
+            return total, 0, 0
+        try:
+            idx = self.meta_index()
+            if self.mode == MODE_LIBRARY:
+                con = idx.connect()
+                try:
+                    r = con.execute("SELECT SUM(status = 'ok'), SUM(has_exif) FROM photo_meta").fetchone()
+                finally:
+                    con.close()
+                return total, int(r[0] or 0), int(r[1] or 0)
+            keys = [path_key(p.image_path) for p in self.photos.photos]
+            n, ex = idx.coverage(keys)
+            return total, n, ex
+        except (sqlite3.Error, OSError, PermissionError):
+            return total, 0, 0
+
+    def analyze_metadata(self, parent=None, done: Optional[Callable] = None) -> None:
+        """Construit / met à jour l'index des métadonnées (incrémental, reprenable, annulable)."""
+        if self.photos is None or self.total_photos() == 0:
+            messagebox.showinfo("Métadonnées", "Ouvrez d'abord une bibliothèque ou un dossier.", parent=parent or self.root)
+            return
+        if self.mode == MODE_LIBRARY and not self.library.is_available():
+            messagebox.showwarning("Métadonnées", "La bibliothèque est inaccessible (disque débranché ?) : "
+                                   "les fichiers ne peuvent pas être lus.", parent=parent or self.root)
+            return
+        try:
+            idx = self.meta_index()
+        except PermissionError as exc:
+            messagebox.showerror("Métadonnées", str(exc), parent=parent or self.root)
+            return
+        items, total = self._metadata_items()
+        prog = mdlib.IndexProgress()
+
+        def work(task):
+            task.total = total
+            th = threading.Thread(target=idx.update, args=(items, prog, task.cancel, total), daemon=True)
+            th.start()
+            while th.is_alive():
+                task.done = prog.done
+                rate = prog.done / max(0.5, time.time() - prog.started)
+                eta = (total - prog.done) / rate if rate > 0 else 0
+                task.text = (f"{format_count(prog.done)} / {format_count(total)} fichiers — {format_count(prog.updated)} "
+                             f"lus, {format_count(prog.skipped)} déjà à jour"
+                             + (f", {prog.missing} introuvables" if prog.missing else "")
+                             + (f" — reste ≈ {int(eta // 60)} min {int(eta % 60)} s" if prog.done > 20 and eta > 5 else ""))
+                th.join(0.2)
+            return prog
+
+        def finished(p, error):
+            if error is not None or (p and p.fatal):
+                messagebox.showerror("Métadonnées", f"Analyse interrompue : {error or p.fatal}", parent=parent or self.root)
+            elif p:
+                msg = (f"Métadonnées : {format_count(p.updated)} fichier(s) analysé(s), {format_count(p.skipped)} déjà à jour"
+                       + (f", {p.missing} introuvable(s)" if p.missing else "")
+                       + (f", {p.errors} illisible(s)" if p.errors else "")
+                       + (" — analyse annulée (elle reprendra là où elle s'est arrêtée)." if p.cancelled else "."))
+                self._set_status(msg)
+            self._attach_meta()
+            if done:
+                done()
+
+        TaskDialog(self, parent or self.root, "Analyse des métadonnées",
+                   f"Analyse des métadonnées de {plural(total, 'photo')} (EXIF, dimensions, GPS)", work, finished)
+
+    def _attach_meta(self) -> None:
+        if self.con is not None and self.mode == MODE_LIBRARY:
+            try:
+                advsearch.install_functions(self.con)
+                advsearch.attach_meta(self.con, self.meta_path())
+            except sqlite3.Error:
+                pass
+
+    def meta_records(self, keys: list) -> dict:
+        """Métadonnées analysées (dict par clé) ; {} si l'index n'existe pas."""
+        if not keys or not os.path.isfile(self.meta_path()):
+            return {}
+        try:
+            con = self.meta_index().connect()
+            try:
+                out = {}
+                for i in range(0, len(keys), 900):
+                    chunk = keys[i:i + 900]
+                    for r in con.execute(f"SELECT * FROM photo_meta WHERE status = 'ok' AND key IN "
+                                         f"({','.join('?' * len(chunk))})", chunk):
+                        out[r["key"]] = dict(r)
+                return out
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError):
+            return {}
+
+    def meta_record(self, key: str, path: str) -> Optional[dict]:
+        rec = self.meta_records([key]).get(key) if key else None
+        if rec is None and path:
+            rec = self.meta_records([path_key(path)]).get(path_key(path))
+        return rec
+
+    def apple_terms_text(self, p: Photo) -> str:
+        if self.mode != MODE_LIBRARY or not os.path.isfile(self.meta_path()):
+            return ""
+        try:
+            terms = self.meta_index().terms_of(self.meta_key(p))
+        except (sqlite3.Error, OSError):
+            return ""
+        parts = []
+        for kind, label in (("keyword", "Mots-clés"), ("person", "Personnes"), ("place", "Lieu")):
+            if terms.get(kind):
+                parts.append(f"{label} : {', '.join(terms[kind])}")
+        return "   ·   ".join(parts)
+
+    # -- annotations pour la recherche ------------------------------------------------------
+    def annotation_source(self):
+        scope = self._scope()
+        ann = self.annotations
+
+        class Snap:
+            def __init__(s):
+                s.fav = ann.favorites(scope)
+                s.tags = {t: ann.keys_with_tag(scope, t) for t in ann.all_tags(scope)}
+
+            def favorites(s):
+                return s.fav
+
+            def keys_with_tag(s, t):
+                t = clean_tag(t)
+                return next((v for k, v in s.tags.items() if normalize_text(k) == normalize_text(t)), set())
+
+            def tagged_keys(s):
+                out = set()
+                for v in s.tags.values():
+                    out |= v
+                return out
+        return Snap()
+
+    def known_tags(self) -> list[str]:
+        try:
+            return self.annotations.all_tags(self._scope())
+        except (sqlite3.Error, OSError):
+            return []
+
+    # -- recherche avancée -----------------------------------------------------------------
+    def open_advanced_search(self, criteria: Optional[dict] = None) -> None:
+        if self.mode == MODE_COLLECTIONS:
+            messagebox.showinfo("Recherche avancée", "La recherche avancée porte sur une bibliothèque ou un dossier. "
+                                "Passez en mode Bibliothèque ou Dossier.", parent=self.root)
+            return
+        if self.photos is None:
+            messagebox.showinfo("Recherche avancée", "Ouvrez d'abord une bibliothèque ou un dossier.", parent=self.root)
+            return
+        if self._adv_dialog is not None and self._adv_dialog.win.winfo_exists():
+            self._adv_dialog.win.lift()
+            if criteria:
+                self._adv_dialog.load(criteria)
+            return
+        self._adv_dialog = AdvancedSearchDialog(self, criteria)
+
+    def run_advanced_search(self, criteria: dict, title: str = "Recherche avancée",
+                            done: Optional[Callable] = None, tree_iid: str = "adv") -> None:
+        try:
+            compiled = advsearch.compile_criteria(criteria, self.search_dialect(), self.annotation_source())
+        except advsearch.CriteriaError as exc:
+            messagebox.showwarning("Recherche avancée", str(exc), parent=self.root)
+            return
+        meta_path = self.meta_path()
+        mode = self.mode
+        if mode == MODE_LIBRARY:
+            index_path = self.cache.index_path
+            sql = advsearch.build_query(compiled, advsearch.LIBRARY, True)
+
+            def work():
+                con = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+                try:
+                    advsearch.install_functions(con)
+                    advsearch.attach_meta(con, meta_path)
+                    return [r[0] for r in con.execute(sql, compiled.params)]
+                finally:
+                    con.close()
+        else:
+            photos = list(self.folder.photos)
+            sql = advsearch.build_query(compiled, advsearch.FOLDER, True)
+
+            def work():
+                con = sqlite3.connect(":memory:")
+                try:
+                    advsearch.install_functions(con)
+                    advsearch.attach_meta(con, meta_path)
+                    advsearch.folder_table(con, photos, lambda p: path_key(p.image_path))
+                    return [r[0] for r in con.execute(sql, compiled.params)]
+                finally:
+                    con.close()
+        self._set_status("Recherche en cours…")
+        t0 = time.time()
+
+        def finished(ids, error):
+            if error is not None:
+                messagebox.showerror("Recherche avancée", f"La recherche a échoué :\n{error}", parent=self.root)
+                return
+            if self.mode != mode:
+                return
+            self.adv_criteria = criteria
+            self.show_ids(ids, title, tree_iid=tree_iid, tree_label=title, desc=advsearch.describe(criteria))
+            note = ""
+            if compiled.uses_meta:
+                total, analysed, _ex = self.metadata_coverage()
+                if analysed < total:
+                    note = f" — {format_count(total - analysed)} photo(s) non analysée(s) exclue(s) des critères EXIF"
+            self._set_status(f"{title} : {plural(len(ids), 'photo')} en {time.time() - t0:.2f} s{note}."
+                             + (" " + compiled.warnings[0] if compiled.warnings else ""))
+            if done:
+                done(len(ids), compiled.warnings + ([note.strip(' —')] if note else []))
+
+        self._run_background(work, finished)
+
+    def show_ids(self, ids: list, title: str, tree_iid: str = "adv", tree_label: str = "Recherche avancée",
+                 desc: str = "") -> None:
+        """Affiche une liste d'identifiants dans la grille (et une entrée dans l'arborescence)."""
+        self._annot_sel = None
+        self.current_album_id = None
+        if self.mode == MODE_LIBRARY:
+            view = View("ids", ids=tuple(ids), title=title, query=desc)
+            self._adv_views[tree_iid] = view
+            self._insert_result_entry(self.tree, tree_iid, tree_label, len(ids))
+            self.set_view(view)
+        else:
+            f = self.folder
+            f.subdir, f.date_range = None, None
+            f.only = {path_key(f.photos[i].image_path) for i in ids if 0 <= i < len(f.photos)}
+            f.only_title = f"{title} : {desc}" if desc else title
+            f.refresh()
+            self.photos = f
+            self._adv_views[tree_iid] = ("folder", set(f.only), f.only_title)
+            self._insert_result_entry(self.ftree, tree_iid, tree_label, len(ids))
+            self.set_view(self._folder_view())
+
+    def _insert_result_entry(self, tree, iid: str, label: str, n: int) -> None:
+        if iid != "adv":
+            self._select_silently(tree, iid) if tree.exists(iid) else None
+            return
+        if tree.exists(iid):
+            tree.delete(iid)
+        tree.insert("", 0, iid=iid, text=f" {label}", values=(format_count(n),), tags=("section",),
+                    image=self.icons.get("search", 16, "accent"))
+        self._select_silently(tree, iid)
+
+    def show_keys_in_grid(self, keys: set, title: str) -> None:
+        """Affiche des photos désignées par leurs clés de métadonnées (doublons, carte)."""
+        if self.mode == MODE_LIBRARY:
+            ids = []
+            for k in keys:
+                if k.startswith("id:"):
+                    ids.append(int(k[3:]))
+            guids = [k for k in keys if not k.startswith("id:")]
+            for i in range(0, len(guids), 900):
+                chunk = guids[i:i + 900]
+                ids += [r[0] for r in self.con.execute(
+                    f"SELECT id FROM photos WHERE guid IN ({','.join('?' * len(chunk))})", chunk)]
+            self.show_ids(ids, title, tree_iid="adv", tree_label="Résultat")
+        elif self.mode == MODE_FOLDER:
+            ids = [p.id for p in self.folder.photos if path_key(p.image_path) in keys]
+            self.show_ids(ids, title, tree_iid="adv", tree_label="Résultat")
+        self.root.lift()
+
+    def photo_from_path(self, path: str) -> Photo:
+        try:
+            st = os.stat(path)
+            size, mtime = st.st_size, st.st_mtime
+        except OSError:
+            size, mtime = 0, 0
+        return Photo(id=-1, guid="", caption="", comment="", rating=0, roll_id=None, media_type="Image",
+                     image_path=path, original_path="", thumb_path="", date=unix_to_interval(mtime) if mtime else None,
+                     mod_date=mtime, filename=os.path.basename(path), size=size, source="folder")
+
+    # -- albums intelligents et recherches enregistrées --------------------------------------
+    def refresh_smart_entries(self) -> None:
+        if self.mode == MODE_LIBRARY:
+            t = self.tree
+            if self.photos is None or not t.exists("all"):
+                return
+        elif self.mode == MODE_FOLDER:
+            t = self.ftree
+            if not self.folder.root or not t.exists("f:"):
+                return
+        else:
+            return
+        try:
+            smart = self.collections.albums("smart")
+            saved = self.collections.searches()
+        except (sqlite3.Error, OSError, RuntimeError):
+            return
+        for iid in ("sec:smart", "sec:saved"):
+            if t.exists(iid):
+                t.delete(iid)
+        anchor = "sec:tags" if t.exists("sec:tags") else "fav"
+        pos = t.index(anchor) + 1 if t.exists(anchor) else 1
+        if smart:
+            t.insert("", pos, iid="sec:smart", text=" Albums intelligents", values=(format_count(len(smart)),),
+                     tags=("section",), image=self.icons.get("smart", 16, "accent"), open=True)
+            for a in smart:
+                t.insert("sec:smart", "end", iid=f"smart:{a.id}", text=" " + a.name, values=("",),
+                         image=self.icons.get("smart", 16))
+            pos += 1
+        if saved:
+            t.insert("", pos, iid="sec:saved", text=" Recherches enregistrées", values=(format_count(len(saved)),),
+                     tags=("section",), image=self.icons.get("search", 16, "accent"), open=False)
+            for sid, name, _c in saved:
+                t.insert("sec:saved", "end", iid=f"saved:{sid}", text=" " + name, values=("",),
+                         image=self.icons.get("search", 16))
+
+    def open_smart(self, album_id: int) -> None:
+        a = self.collections.get(album_id)
+        if a is None or not a.criteria:
+            return
+        self.run_advanced_search(a.criteria, title=f"Album intelligent « {a.name} »", tree_iid=f"smart:{album_id}")
+
+    def open_saved_search(self, search_id: int) -> None:
+        for sid, name, crit in self.collections.searches():
+            if sid == search_id:
+                self.run_advanced_search(crit, title=f"Recherche « {name} »", tree_iid=f"saved:{sid}")
+                return
+
+    def smart_menu(self, iid: str, x: int, y: int, tree) -> None:
+        m = tk.Menu(tree, tearoff=False)
+        if iid.startswith("smart:"):
+            aid = int(iid[6:])
+            a = self.collections.get(aid)
+            m.add_command(label="  Modifier les critères…", command=lambda: AdvancedSearchDialog(self, a.criteria, aid),
+                          image=self.icons.get("search", 16), compound="left")
+            m.add_command(label="  Renommer…", command=lambda: self._rename_valbum(aid))
+            m.add_separator()
+            m.add_command(label="  Supprimer l'album intelligent", command=lambda: self._delete_valbum(aid))
+        elif iid.startswith("saved:"):
+            sid = int(iid[6:])
+            crit = next((c for i, _n, c in self.collections.searches() if i == sid), None)
+            m.add_command(label="  Ouvrir dans la recherche avancée…", command=lambda: self.open_advanced_search(crit))
+            m.add_separator()
+            m.add_command(label="  Supprimer la recherche", command=lambda: (self.collections.delete_search(sid),
+                                                                             self.refresh_smart_entries()))
+        try:
+            m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    # -- chronologie ---------------------------------------------------------------------------
+    def _timeline_data(self) -> "tl.Timeline":
+        key = (self.mode, self.library.root, self.total_photos())
+        if self._timeline is None or self._timeline_key != key:
+            if self.mode == MODE_LIBRARY:
+                rows = self.con.execute("SELECT id, date FROM photos").fetchall()
+                items = [(r[0], storage.apple_to_unix(r[1])) for r in rows]
+            else:
+                items = [(p.id, storage.apple_to_unix(p.date)) for p in self.folder.photos]
+            self._timeline = tl.Timeline.build(items)
+            valid = {i for i, ts in items if tl._valid(ts) is not None}
+            self._tl_unknown = [i for i, _t in items if i not in valid]
+            self._timeline_key = key
+        return self._timeline
+
+    def show_timeline(self, level: str = "years", year: Optional[int] = None, month: Optional[int] = None,
+                      push: bool = True) -> None:
+        if self.photos is None or self.mode == MODE_COLLECTIONS:
+            return
+        if push and self.view.kind in ("timeline", "date") and level != "years":
+            self._tl_stack.append(self.view)
+        elif level == "years":
+            self._tl_stack = []
+        t = self._timeline_data()
+        if level == "years":
+            title = "Chronologie"
+        elif level == "months":
+            title = f"Chronologie · {year}"
+        else:
+            title = f"Chronologie · {tl.MONTHS_FR[month - 1].capitalize()} {year}"
+        self._annot_sel = None
+        self.folder.date_range = None
+        self.set_view(View("timeline", level=level, year=year, month=month, title=title))
+
+    def _timeline_periods(self) -> list:
+        t = self._timeline_data()
+        v = self.view
+        if v.level == "years":
+            return t.year_periods()
+        if v.level == "months":
+            return t.month_periods(v.year)
+        return t.day_periods(v.year, v.month)
+
+    def _timeline_photo(self, pid: Optional[int]) -> Optional[Photo]:
+        if pid is None:
+            return None
+        return self.photos.get(pid) if self.mode == MODE_LIBRARY else self.folder.get(pid)
+
+    def open_period(self, per) -> None:
+        v = self.view
+        if per.level == "year":
+            self.show_timeline("months", per.year)
+        elif per.level == "month" and per.count:
+            self.show_timeline("days", per.year, per.month)
+        elif per.level == "day":
+            self._tl_stack.append(v)
+            start, end = storage.unix_to_apple(per.start), storage.unix_to_apple(per.end)
+            title = f"Photos du {per.label}"
+            if self.mode == MODE_LIBRARY:
+                self.set_view(View("date", start=start, end=end, title=title))
+            else:
+                f = self.folder
+                f.only, f.subdir = None, None
+                f.date_range = (start, end)
+                f.range_title = title
+                f.refresh()
+                self.photos = f
+                self.set_view(self._folder_view())
+        elif per.level == "unknown":
+            self._tl_stack.append(v)
+            self.show_ids(self._tl_unknown, "Photos sans date exploitable", tree_iid="timeline")
+        self._update_back()
+
+    def timeline_back(self) -> None:
+        if not self._tl_stack:
+            self.show_timeline("years", push=False)
+            return
+        prev = self._tl_stack.pop()
+        self.folder.date_range = None
+        if prev.kind == "timeline":
+            self.set_view(prev)
+        self._update_back()
+
+    def _update_back(self) -> None:
+        show = (self.view.kind == "timeline" and self.view.level != "years") or bool(self._tl_stack)
+        show = show and self._tree_current() == "timeline"
+        if show and not self.btn_back.winfo_ismapped():
+            self.btn_back.pack(side="left", padx=(0, SPACE_M), anchor="n", before=self.header_left)
+        elif not show and self.btn_back.winfo_ismapped():
+            self.btn_back.pack_forget()
+
+    def _tree_current(self) -> str:
+        t = {MODE_LIBRARY: self.tree, MODE_FOLDER: self.ftree}.get(self.mode, getattr(self, "ctree", self.tree))
+        sel = t.selection()
+        return sel[0] if sel else ""
+
+    def _draw_period(self, i: int, per) -> None:
+        c = self.canvas
+        x, y = self._tile_origin(i)
+        tag = f"t{i}"
+        empty = per.level in ("gap",) or (per.level == "month" and per.count == 0)
+        c.create_image(x, y, image=self.card_image("hover" if self.hover_index == i and not empty else "normal"),
+                       anchor="nw", tags=(tag, f"bg{i}"))
+        wx, wy = x + (TILE_W - THUMB_SIZE) // 2, y + 12
+        cx, cy = wx + THUMB_SIZE // 2, wy + THUMB_SIZE // 2
+        c.create_image(wx, wy, image=self.well_image(), anchor="nw", tags=(tag,))
+        state = self.tile_images.get(i)
+        if isinstance(state, dict) and state.get("img") is not None:
+            c.create_image(cx, cy, image=state["img"], tags=(tag,))
+        else:
+            icon = "event" if per.level != "unknown" else "warning"
+            c.create_image(cx, cy - (8 if empty else 0), image=self.icons.get(icon, 32, "faint"), tags=(tag,))
+            if empty:
+                c.create_text(cx, cy + 24, text="Aucune photo", fill=COLORS["muted"], font=self.font_small, tags=(tag,))
+        if per.top and per.count:
+            w = self.font_badge.measure("LA PLUS RICHE") + 30
+            c.create_image(wx + 6, wy + 6, image=self.pill_image(w, 20), anchor="nw", tags=(tag,))
+            c.create_image(wx + 15, wy + 16, image=self.icons.get("star_fill", 10, "star"), tags=(tag,))
+            c.create_text(wx + 24, wy + 16, text="LA PLUS RICHE", fill="#FFFFFF", font=self.font_badge, anchor="w",
+                          tags=(tag,))
+        ty = wy + THUMB_SIZE + 10
+        c.create_text(x + 14, ty, text=self._truncate(per.label, self.font_bold, TILE_W - 28), anchor="nw",
+                      fill=COLORS["faint"] if empty else COLORS["text"], font=self.font_bold, tags=(tag,))
+        sub = ("Période sans photo" if per.level == "gap" else plural(per.count, "photo"))
+        c.create_text(x + 14, ty + 19, text=sub, anchor="nw", fill=COLORS["muted"], font=self.font_small, tags=(tag,))
+
+    # -- collections (albums virtuels) --------------------------------------------------------
+    def _populate_ctree(self) -> None:
+        t = self.ctree
+        sel = t.selection()
+        t.delete(*t.get_children())
+        try:
+            albums = self.collections.albums("manual")
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            t.insert("", "end", text=f" Collections illisibles : {exc}", tags=("error",),
+                     image=self.icons.get("warning", 16, "missing"))
+            return
+        t.insert("", "end", iid="sec:valbums", text=" Albums virtuels", values=(format_count(len(albums)),),
+                 tags=("section",), open=True, image=self.icons.get("album", 16, "accent"))
+        for a in albums:
+            t.insert("sec:valbums", "end", iid=f"va:{a.id}", text=" " + a.name, values=(format_count(a.count),),
+                     image=self.icons.get("album", 16), tags=("empty",) if a.count == 0 else ())
+        if not albums:
+            t.insert("sec:valbums", "end", iid="va:none", text="Aucun album : sélectionnez des photos puis "
+                     "« Album virtuel… »", tags=("empty",))
+        if sel and t.exists(sel[0]):
+            self._select_silently(t, sel[0])
+
+    def _on_ctree_select(self, _event=None) -> None:
+        if self.mode != MODE_COLLECTIONS or self._tree_silent:
+            return
+        sel = self.ctree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        if iid.startswith("va:") and iid != "va:none":
+            self.open_valbum(int(iid[3:]))
+        elif iid == "sec:valbums":
+            self.set_view(View("empty", title="Albums virtuels"),
+                          message="Un album virtuel regroupe des photos de plusieurs bibliothèques et dossiers, "
+                                  "sans copier ni déplacer les fichiers.\n\nSélectionnez des photos (Ctrl+clic), puis "
+                                  "« Album virtuel… » dans la barre de sélection.")
+
+    def open_valbum(self, album_id: int) -> None:
+        a = self.collections.get(album_id)
+        if a is None:
+            return
+        items = self.collections.items(album_id)
+        b = CollectionBrowser()
+        b.load_items(items)
+        self.coll_browser = b
+        self.library.set_items(items)
+        self.photos = b
+        self.current_valbum = album_id
+        self.set_view(View("valbum", album_id=album_id, title=f"Album virtuel : {a.name}"))
+
+    def valbum_menu(self, iid: str, x: int, y: int) -> None:
+        m = tk.Menu(self.ctree, tearoff=False)
+        ic = self.icons
+        m.add_command(label="  Nouvel album virtuel…", command=self.new_valbum, image=ic.get("album", 16), compound="left")
+        if iid.startswith("va:") and iid != "va:none":
+            aid = int(iid[3:])
+            m.add_separator()
+            m.add_command(label="  Renommer…", command=lambda: self._rename_valbum(aid))
+            m.add_command(label="  Propriétés", command=lambda: self._valbum_properties(aid),
+                          image=ic.get("info", 16), compound="left")
+            m.add_command(label="  Retrouver les photos introuvables…", command=lambda: self._relocate_valbum(aid),
+                          image=ic.get("search", 16), compound="left")
+            m.add_separator()
+            m.add_command(label="  Diaporama", command=lambda: (self.open_valbum(aid), self.start_slideshow("view")))
+            m.add_command(label="  Copier les photos vers un dossier…",
+                          command=lambda: self._copy_valbum(aid), image=ic.get("folder_arrow", 16), compound="left")
+            m.add_command(label="  Exporter les métadonnées…", command=lambda: (self.open_valbum(aid),
+                                                                                ExportDialog(self, self.root, "view")))
+            m.add_separator()
+            m.add_command(label="  Supprimer l'album (les photos ne sont pas supprimées)",
+                          command=lambda: self._delete_valbum(aid))
+        try:
+            m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    def new_valbum(self) -> None:
+        d = TextDialog(self, self.root, "Nouvel album virtuel", "Nouvel album virtuel", "Nom de l'album",
+                       icon="album", ok_text="Créer")
+        if d.result:
+            aid = self.collections.create(d.result)
+            if self.mode == MODE_COLLECTIONS:
+                self._populate_ctree()
+                self.ctree.selection_set(f"va:{aid}")
+
+    def _rename_valbum(self, aid: int) -> None:
+        a = self.collections.get(aid)
+        if a is None:
+            return
+        d = TextDialog(self, self.root, "Renommer", "Renommer l'album", "Nouveau nom", a.name, icon="album",
+                       ok_text="Renommer")
+        if d.result:
+            self.collections.rename(aid, d.result)
+            self._populate_ctree() if self.mode == MODE_COLLECTIONS else self.refresh_smart_entries()
+
+    def _delete_valbum(self, aid: int) -> None:
+        a = self.collections.get(aid)
+        if a is None:
+            return
+        what = "l'album intelligent" if a.kind == "smart" else "l'album virtuel"
+        if not messagebox.askyesno("Supprimer", f"Supprimer {what} « {a.name} » ?\n\nSeules les références sont "
+                                   "supprimées : aucune photo n'est effacée.", parent=self.root):
+            return
+        self.collections.delete(aid)
+        if a.kind == "smart":
+            self.refresh_smart_entries()
+        else:
+            self._populate_ctree()
+            if self.current_valbum == aid:
+                self.current_valbum = None
+                self.photos = None
+                self.set_view(View("empty", title="Albums virtuels"))
+
+    def _valbum_properties(self, aid: int) -> None:
+        a = self.collections.get(aid)
+        items = self.collections.items(aid)
+        scopes: dict[str, int] = {}
+        for i in items:
+            label = "Dossiers" if i.scope == FILES_SCOPE else os.path.basename(i.scope[4:]) or i.scope
+            scopes[label] = scopes.get(label, 0) + 1
+        missing = [i for i in items if not i.exists]
+        rows = [("#", "Album virtuel"), ("Nom", a.name), ("Photos", format_count(len(items))),
+                ("Introuvables", format_count(len(missing)), "warn" if missing else ""),
+                ("Créé le", format_date(storage.unix_to_apple(a.created)) if a.created else "—"),
+                ("Modifié le", format_date(storage.unix_to_apple(a.modified)) if a.modified else "—"),
+                ("#", "Sources")] + [(k, format_count(v)) for k, v in sorted(scopes.items())]
+        if missing:
+            rows += [("#", "Références introuvables (extrait)")] + [(i.filename, safe_text(i.path), "warn")
+                                                                     for i in missing[:30]]
+        InfoDialog(self, self.root, "Album virtuel", a.name, "Les albums virtuels ne contiennent que des références.",
+                   rows, icon="album")
+
+    def _relocate_valbum(self, aid: int) -> None:
+        missing = [i for i in self.collections.items(aid) if not i.exists]
+        if not missing:
+            messagebox.showinfo("Retrouver", "Toutes les photos de cet album sont accessibles.", parent=self.root)
+            return
+        folder = filedialog.askdirectory(parent=self.root, mustexist=True,
+                                         title=f"Dossier où chercher les {len(missing)} photo(s) introuvable(s)")
+        if not folder:
+            return
+        old_common = os.path.commonpath([os.path.dirname(i.path) for i in missing if i.path]) if all(
+            i.path for i in missing) else ""
+
+        def work(task):
+            task.text = "Recherche par nom et taille (lecture seule)…"
+            n = 0
+            if old_common and old_common != "/":
+                n = self.collections.relocate(aid, old_common, folder)
+            return n + self.collections.find_by_name(aid, folder, cancelled=task.cancel.is_set)
+
+        def done(n, error):
+            if error is not None:
+                messagebox.showerror("Retrouver", str(error), parent=self.root)
+                return
+            left = sum(1 for i in self.collections.items(aid) if not i.exists)
+            messagebox.showinfo("Retrouver", f"{plural(n or 0, 'référence retrouvée', 'références retrouvées')}."
+                                + (f"\n{left} photo(s) restent introuvables." if left else ""), parent=self.root)
+            self._populate_ctree()
+            if self.current_valbum == aid:
+                self.open_valbum(aid)
+
+        TaskDialog(self, self.root, "Retrouver", "Recherche des photos introuvables", work, done, icon="search")
+
+    def _copy_valbum(self, aid: int) -> None:
+        a = self.collections.get(aid)
+        self.open_valbum(aid)
+        photos = self.coll_browser.page(None, 0, self.coll_browser.count())
+        self._start_copy([(p, "") for p in photos], f"l'album virtuel « {a.name} »", plural(len(photos), "photo"), a.name)
+
+    def valbum_remove_selection(self) -> None:
+        if self.current_valbum is None:
+            return
+        refs = [p.ref for p in self.selected_photos() if p.ref]
+        n = self.collections.remove(self.current_valbum, refs)
+        self.clear_selection()
+        self._set_status(f"{plural(n, 'photo retirée', 'photos retirées')} de l'album virtuel (fichiers intacts).")
+        self.open_valbum(self.current_valbum)
+        self._populate_ctree()
+
+    def valbum_move_selection(self, delta: int) -> None:
+        if self.current_valbum is None:
+            return
+        refs = [p.ref for p in self.selected_photos() if p.ref]
+        self.collections.move(self.current_valbum, refs, delta)
+        keep = set(refs)
+        self.open_valbum(self.current_valbum)
+        self.selection = {self.photo_key(p): p for p in self.coll_browser.photos if p.ref in keep}
+        self._selection_changed()
+
+    # -- portées (sélection / vue / source) ------------------------------------------------------
+    def scope_photos(self, scope: str) -> list[Photo]:
+        if scope == "selection":
+            return self.selected_photos()
+        if self.photos is None:
+            return []
+        if scope == "view":
+            if self.view.kind in ("empty", "timeline"):
+                return []
+            return self.photos.page(self.view, 0, self.total)
+        if self.mode == MODE_LIBRARY:
+            return self.photos.page(View("all"), 0, self.total_photos())
+        return list(getattr(self.photos, "photos", []))
+
+    def scope_count(self, scope: str) -> int:
+        if scope == "selection":
+            return len(self.selection)
+        if scope == "view":
+            return 0 if self.view.kind in ("empty", "timeline") else self.total
+        return self.total_photos()
+
+    def build_records(self, photos: list) -> list[dict]:
+        """Enregistrements pour l'export et les statistiques (index + métadonnées + annotations)."""
+        keys = [self.meta_key(p) for p in photos]
+        metas = self.meta_records(keys)
+        snap = self.annotation_source()
+        fav = snap.favorites()
+        tag_of: dict[str, list] = {}
+        for t, ks in snap.tags.items():
+            for k in ks:
+                tag_of.setdefault(k, []).append(t)
+        terms: dict[str, list] = {}
+        if self.mode == MODE_LIBRARY and os.path.isfile(self.meta_path()):
+            try:
+                con = self.meta_index().connect()
+                for r in con.execute("SELECT key, value FROM apple_terms WHERE kind = 'keyword'"):
+                    terms.setdefault(r[0], []).append(r[1])
+                con.close()
+            except sqlite3.Error:
+                pass
+        out = []
+        for p, mk in zip(photos, keys):
+            ak = self._key(p)[1]
+            m = metas.get(mk, {})
+            rec = {k: m.get(k) for k in ("status", "width", "height", "has_exif", "make", "model", "lens", "focal",
+                                         "focal35", "aperture", "exposure", "iso", "taken", "gps_lat", "gps_lon",
+                                         "gps_alt")}
+            rec.update(filename=p.filename, media_type=p.media_type, caption=p.caption, comment=p.comment,
+                       rating=p.rating or None, event=p.event_name,
+                       path=m.get("path") or (p.image_path if p.source == "folder" else self.library.to_linux(p.image_path)),
+                       date=storage.apple_to_unix(p.date), file_size=m.get("file_size") or p.size or None,
+                       favorite=ak in fav, tags=sorted(tag_of.get(ak, []), key=normalize_text),
+                       keywords=sorted(terms.get(mk, [])))
+            out.append(rec)
+        return out
+
+    # -- export -----------------------------------------------------------------------------
+    def export_metadata(self, scope: str, fmt: str, fields: list, path: str) -> None:
+        photos = self.scope_photos(scope)
+        if not photos:
+            messagebox.showinfo("Export", "Aucune photo à exporter.", parent=self.root)
+            return
+        records = self.build_records(photos)
+        protected = self._protected_roots()
+
+        def work(task):
+            task.total = len(records)
+
+            def prog(n):
+                task.done = n
+                task.text = f"{format_count(n)} / {format_count(len(records))} photos"
+            return mexport.write(path, fmt, records, fields, protected, task.cancel, prog)
+
+        def done(n, error):
+            if isinstance(error, InterruptedError):
+                self._set_status("Export annulé : aucun fichier écrit.")
+            elif error is not None:
+                messagebox.showerror("Export", f"Export impossible :\n{error}", parent=self.root)
+            else:
+                self._set_status(f"Export {fmt.upper()} : {plural(n, 'photo')} dans {safe_text(path)}")
+                messagebox.showinfo("Export terminé", f"{plural(n, 'photo exportée', 'photos exportées')} dans :\n"
+                                    f"{safe_text(path)}", parent=self.root)
+
+        TaskDialog(self, self.root, "Export", f"Export de {plural(len(records), 'photo')} en {fmt.upper()}", work, done,
+                   icon="file")
+
+    # -- statistiques ------------------------------------------------------------------------
+    def compute_stats(self, scope: str, done: Callable) -> None:
+        photos = self.scope_photos(scope)
+        cache_key = (self.mode, self.library.root, scope, len(photos),
+                     os.path.getmtime(self.meta_path()) if os.path.isfile(self.meta_path()) else 0,
+                     self.view.title if scope == "view" else "", tuple(sorted(self.selection)) if scope == "selection" else ())
+        if self._stats_cache.get("key") == cache_key:
+            done(self._stats_cache["value"], None)
+            return
+        records = self.build_records(photos)
+
+        def work():
+            return statlib.compute(records)
+
+        def finished(result, error):
+            if error is None:
+                self._stats_cache = {"key": cache_key, "value": result}
+            done(result, error)
+        self._run_background(work, finished)
+
+    def open_stats(self) -> None:
+        if self.photos is None or self.total_photos() == 0:
+            messagebox.showinfo("Statistiques", "Ouvrez d'abord une bibliothèque ou un dossier.", parent=self.root)
+            return
+        StatsWindow(self)
+
+    # -- doublons -------------------------------------------------------------------------------
+    def _dup_results_path(self) -> str:
+        if self.mode == MODE_LIBRARY:
+            return os.path.join(self.cache.cache_dir, "doublons.json")
+        h = hashlib.sha1((self.library.root or "collections").encode("utf-8", "surrogateescape")).hexdigest()[:16]
+        return os.path.join(FOLDER_CACHE_DIR, f"doublons-{h}.json")
+
+    def find_duplicates(self) -> None:
+        if self.photos is None or self.total_photos() == 0:
+            messagebox.showinfo("Doublons", "Ouvrez d'abord une bibliothèque ou un dossier.", parent=self.root)
+            return
+        scope = "selection" if len(self.selection) >= 2 else "source"
+        if scope == "source" and not self._view_is_whole_source() and self.total >= 2:
+            ans = messagebox.askyesnocancel("Doublons", f"Analyser seulement la vue affichée ({plural(self.total, 'photo')}) ?"
+                                            f"\n\nNon : toute la source ({plural(self.total_photos(), 'photo')}).",
+                                            parent=self.root)
+            if ans is None:
+                return
+            scope = "view" if ans else "source"
+        photos = [p for p in self.scope_photos(scope) if not p.is_video]
+        lib = self.library
+        idx = self.meta_index()
+        metas = self.meta_records([self.meta_key(p) for p in photos])
+        entries = []
+        for p in photos:
+            mk = self.meta_key(p)
+            m = metas.get(mk, {})
+            entries.append(dupes.Entry(key=mk, path="", size=m.get("file_size") or p.size or 0, width=m.get("width"),
+                                       height=m.get("height"), date=storage.apple_to_unix(p.date),
+                                       label=p.filename))
+        cached = {}
+        if os.path.isfile(self.meta_path()):
+            try:
+                con = idx.connect()
+                cached = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+                    "SELECT key, sha256, phash, hash_sig FROM photo_meta WHERE sha256 IS NOT NULL")}
+                con.close()
+            except sqlite3.Error:
+                cached = {}
+
+        def work(task):
+            task.total = len(entries)
+            task.text = "Recherche des fichiers…"
+            pending = []
+            for e, p in zip(entries, photos):
+                if task.cancel.is_set():
+                    return None
+                e.path = resolve_photo_file(lib, p, True) or ""
+                sig = storage.file_signature(e.path) if e.path else None
+                c = cached.get(e.key)
+                if c and sig and c[2] == sig:
+                    e.sha256, e.phash = c[0], c[1]
+                if not e.size and sig:
+                    e.size = int(sig.split(":")[0])
+                if e.path and not e.width:      # dimensions lues dans l'en-tête (lecture seule, rapide)
+                    try:
+                        with Image.open(e.path) as im:
+                            e.width, e.height = im.size
+                    except Exception:
+                        pass
+            usable = [e for e in entries if e.path]
+
+            def prog(d, n):
+                task.done = d
+                task.text = f"Empreintes : {format_count(d)} / {format_count(n)} fichiers (lecture seule)"
+
+            def hashed(e):
+                pending.append((e.key, storage.file_signature(e.path), e.sha256, e.phash))
+                if len(pending) >= 200:
+                    try:
+                        idx.set_hashes(pending[:])
+                    except sqlite3.Error:
+                        pass
+                    pending.clear()
+            bad = dupes.hash_entries(usable, True, prog, task.cancel, hashed)
+            if pending:
+                try:
+                    idx.set_hashes(pending)
+                except sqlite3.Error:
+                    pass
+            if task.cancel.is_set():
+                return None
+            task.text = "Regroupement…"
+            rep = dupes.find_groups(usable)
+            rep.unreadable = bad + (len(entries) - len(usable))
+            return rep
+
+        def done(rep, error):
+            if error is not None:
+                messagebox.showerror("Doublons", f"Analyse impossible :\n{error}", parent=self.root)
+                return
+            if rep is None:
+                self._set_status("Recherche de doublons annulée (les empreintes calculées sont conservées).")
+                return
+            try:
+                path = self._dup_results_path()
+                storage.assert_outside(path, self._protected_roots())
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                    json.dump({"time": time.time(), "analysed": rep.analysed,
+                               "groups": [g.to_json() for g in rep.groups]}, fh)
+                os.replace(path + ".tmp", path)
+            except (OSError, PermissionError):
+                pass
+            c = rep.counts()
+            self._set_status(f"Doublons : {c[dupes.IDENTICAL]} groupe(s) identiques, {c[dupes.NEAR]} quasi-identiques, "
+                             f"{c[dupes.SIMILAR]} proches sur {format_count(rep.analysed)} fichiers.")
+            DuplicatesWindow(self, rep)
+
+        TaskDialog(self, self.root, "Doublons", f"Recherche des doublons parmi {plural(len(entries), 'photo')}",
+                   work, done, icon="copy")
+
+    def _view_is_whole_source(self) -> bool:
+        if self.view.kind in ("empty", "timeline", "all"):
+            return True
+        if self.mode == MODE_FOLDER and self.view.kind == "folder":
+            f = self.folder
+            return not (f.subdir or f.only is not None or f.query or f.date_range is not None)
+        return False
+
+    def open_last_duplicates(self) -> None:
+        path = self._dup_results_path()
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            messagebox.showinfo("Doublons", "Aucun résultat enregistré pour cette source : lancez d'abord une recherche.",
+                                parent=self.root)
+            return
+        rep = dupes.Report([dupes.Group.from_json(g) for g in data.get("groups", [])], data.get("analysed", 0))
+        DuplicatesWindow(self, rep, saved_at=data.get("time"))
+
+    # -- comparaison, carte, diaporama ------------------------------------------------------
+    def compare_selection(self) -> None:
+        photos = self.selected_photos()
+        if len(photos) != 2:
+            messagebox.showinfo("Comparer", "Sélectionnez exactement deux photos (Ctrl+clic).", parent=self.root)
+            return
+        items = []
+        for p in photos:
+            path, _o = self.library.find_display_file(p, for_thumbnail=False)
+            if not path:
+                messagebox.showwarning("Comparer", f"Fichier introuvable : {p.filename}", parent=self.root)
+                return
+            items.append((p.label, path, self.meta_key(p)))
+        CompareWindow(self, items)
+
+    def open_map(self) -> None:
+        if self.photos is None or self.mode == MODE_COLLECTIONS:
+            messagebox.showinfo("Carte", "Ouvrez une bibliothèque ou un dossier.", parent=self.root)
+            return
+        total, analysed, _ex = self.metadata_coverage()
+        if analysed == 0:
+            if messagebox.askyesno("Carte", "Les coordonnées GPS viennent de l'analyse des métadonnées, qui n'a pas "
+                                   "encore été faite pour cette source.\n\nLancer l'analyse maintenant ?",
+                                   parent=self.root):
+                self.analyze_metadata(done=self.open_map)
+            return
+        points = []
+        try:
+            con = self.meta_index().connect()
+            places = {}
+            for r in con.execute("SELECT key, value FROM apple_terms WHERE kind = 'place'"):
+                places.setdefault(r[0], r[1])
+            rows = con.execute("SELECT key, photo_id, gps_lat, gps_lon, path FROM photo_meta "
+                               "WHERE gps_lat IS NOT NULL").fetchall()
+            con.close()
+        except sqlite3.Error as exc:
+            messagebox.showerror("Carte", str(exc), parent=self.root)
+            return
+        allowed = None if self.mode == MODE_LIBRARY else {path_key(p.image_path) for p in self.folder.photos}
+        for r in rows:
+            if allowed is not None and r[0] not in allowed:
+                continue
+            points.append(geo.Point(r[0], r[1], r[2], r[3], os.path.basename(r[4] or ""), places.get(r[0], "")))
+        GeoWindow(self, points, total - analysed)
+
+    def start_slideshow(self, scope: str = "") -> None:
+        if not scope:
+            scope = "selection" if len(self.selection) > 1 else "view"
+        photos = self.scope_photos(scope)
+        if not photos:
+            messagebox.showinfo("Diaporama", "Aucune photo à afficher : ouvrez un album, un dossier ou sélectionnez "
+                                "des photos.", parent=self.root)
+            return
+        start = 0
+        if scope == "view" and self.hover_index is not None:
+            start = self.page_no * PAGE_SIZE + self.hover_index
+        SlideshowWindow(self, photos, start)
+
+    # -- mots-clés Apple ------------------------------------------------------------------------
+    def import_apple_terms(self) -> None:
+        if self.mode != MODE_LIBRARY or self.photos is None:
+            messagebox.showinfo("Informations Apple", "Disponible pour une bibliothèque iPhoto ou Photos ouverte.",
+                                parent=self.root)
+            return
+        if not self.library.is_available():
+            messagebox.showwarning("Informations Apple", "Bibliothèque inaccessible (disque débranché ?).",
+                                   parent=self.root)
+            return
+        root, workdir, protected = self.library.root, self.cache.cache_dir, self._protected_roots()
+        idx = self.meta_index()
+
+        def work(task):
+            task.text = "Lecture des bases Apple (copiées dans le cache, jamais ouvertes sur place)…"
+            res = applemeta.import_terms(root, workdir, protected)
+            idx.replace_terms("keyword", res.keywords)
+            idx.replace_terms("person", res.persons)
+            idx.replace_terms("place", res.places)
+            return res
+
+        def done(res, error):
+            if error is not None:
+                messagebox.showerror("Informations Apple", f"Lecture impossible :\n{error}", parent=self.root)
+                return
+            self._attach_meta()
+            rows = [("#", "Résultat"), ("Importé", res.summary()),
+                    ("Bases lues", ", ".join(res.sources) or "aucune")]
+            if res.notes:
+                rows += [("#", "Remarques")] + [("•", n) for n in res.notes]
+            rows += [("#", "Utilisation"), ("Recherche avancée", "critères « Mot-clé Apple », « Personne », « Lieu »"),
+                     ("Visionneuse", "affichés sous la photo"),
+                     ("Fiabilité", "lecture expérimentale : schéma détecté, non vérifié sur toutes les versions")]
+            InfoDialog(self, self.root, "Informations Apple", "Mots-clés, personnes et lieux", res.summary(), rows,
+                       icon="tag")
+            self._set_status("Informations Apple : " + res.summary())
+
+        TaskDialog(self, self.root, "Informations Apple", "Import des mots-clés, personnes et lieux", work, done,
+                   icon="tag", cancellable=False)
+
+    # -- dossiers récents, favoris, surveillance ------------------------------------------------
+    def _rebuild_folder_menus(self) -> None:
+        for menu, lst, empty in ((self.m_recent_folders, self.settings.recent_folders, "(aucun dossier récent)"),
+                                 (self.m_fav_folders, self.settings.folder_favorites, "(aucun dossier favori)")):
+            menu.delete(0, "end")
+            if menu is self.m_fav_folders:
+                menu.add_command(label="Ajouter le dossier ouvert aux favoris", command=self.add_folder_favorite)
+                menu.add_command(label="Retirer le dossier ouvert des favoris", command=self.remove_folder_favorite)
+                menu.add_separator()
+            if not lst:
+                menu.add_command(label=empty, state="disabled")
+            for path in lst:
+                label = os.path.basename(path.rstrip("/")) or path
+                menu.add_command(label=f"{safe_text(label)}   —   {safe_text(os.path.dirname(path))}",
+                                 command=lambda p=path: self.open_folder_path(p))
+
+    def open_folder_path(self, path: str) -> None:
+        if not os.path.isdir(path):
+            messagebox.showerror("Dossier inaccessible", f"Ce dossier n'existe pas ou n'est plus accessible :\n"
+                                 f"{safe_text(path)}\n\nLe disque est peut-être débranché.", parent=self.root)
+            return
+        if self.mode != MODE_FOLDER:
+            self.set_mode(MODE_FOLDER, restore=False)
+            if self.mode != MODE_FOLDER:
+                return
+        self.open_folder(path)
+
+    def add_folder_favorite(self) -> None:
+        root = self.folder.root
+        if not root:
+            messagebox.showinfo("Dossiers favoris", "Ouvrez d'abord un dossier.", parent=self.root)
+            return
+        if root not in self.settings.folder_favorites:
+            self.settings.folder_favorites.append(root)
+            self.settings.save()
+        self._rebuild_folder_menus()
+        self._set_status(f"« {safe_text(os.path.basename(root))} » ajouté aux dossiers favoris.")
+
+    def remove_folder_favorite(self) -> None:
+        root = self.folder.root
+        if root in self.settings.folder_favorites:
+            self.settings.folder_favorites.remove(root)
+            self.settings.save()
+            self._rebuild_folder_menus()
+
+    def _folder_snapshot(self, scanner: "FolderScanner") -> str:
+        """Compare avec la dernière visite (instantané dans le cache) ; renvoie un résumé."""
+        try:
+            new = folderlib.entries_signature(scanner.entries)
+            old, when, rec = folderlib.load_snapshot(FOLDER_CACHE_DIR, scanner.root)
+            folderlib.save_snapshot(FOLDER_CACHE_DIR, scanner.root, new, scanner.recursive)
+            self._folder_sig = new
+        except (OSError, PermissionError, ValueError):
+            return ""
+        if old is None or rec != scanner.recursive:
+            return ""
+        d = folderlib.compare(old, new)
+        if d.empty:
+            return ""
+        return f"Depuis la dernière visite : {d.summary()}"
+
+    def toggle_folder_watch(self) -> None:
+        self.settings.folder_watch = bool(self.watch_var.get())
+        self.settings.save()
+        self._set_status("Surveillance du dossier activée (vérification toutes les 30 s, sans rien modifier)."
+                         if self.settings.folder_watch else "Surveillance du dossier désactivée.")
+
+    def _watch_tick(self) -> None:
+        """Toutes les 5 s : disque de la source ; toutes les 30 s : dossier surveillé (passif)."""
+        try:
+            self._watch_disk()
+            self._watch_count += 1
+            if (self._watch_count % 6 == 0 and self.settings.folder_watch and self.mode == MODE_FOLDER
+                    and self.folder.root and self._scanner is None and not self._watch_busy):
+                self._watch_folder()
+        finally:
+            self.root.after(5000, self._watch_tick)
+
+    def _watch_folder(self) -> None:
+        root, recursive, old = self.folder.root, self.folder.recursive, dict(self._folder_sig or {})
+        self._watch_busy = True
+
+        def work():
+            sc = FolderScanner(root, recursive)
+            sc.run()
+            return folderlib.compare(old, folderlib.entries_signature(sc.entries))
+
+        def done(d, error):
+            self._watch_busy = False
+            if error is None and d is not None and not d.empty and self.folder.root == root:
+                self._set_status(f"Le dossier a changé : {d.summary()} — appuyez sur F5 pour actualiser.")
+        self._run_background(work, done)
+
+    def _watch_disk(self) -> None:
+        if self.mode != MODE_LIBRARY or self._building or not self.library.root:
+            return
+        avail = self.library.is_available()
+        if self._disk_ok is None:
+            self._disk_ok = avail
+            return
+        if avail == self._disk_ok:
+            return
+        self._disk_ok = avail
+        if not avail:
+            self.loader.cancel_pending()
+            self._set_status("⚠ Bibliothèque déconnectée : l'index reste consultable, les originaux ne sont plus "
+                             "accessibles. Rebranchez le disque : la reprise est automatique.")
+        else:
+            self._set_status("Bibliothèque de nouveau accessible : les fichiers sont relus.")
+            if self.page_photos and self.view.kind != "timeline":
+                self.load_page()
+
+    # -- maintenance et diagnostic -------------------------------------------------------------
+    def show_diagnostic(self) -> None:
+        rows = [("#", "Dépendances")]
+        for d in depcheck.check():
+            state = "présent" if d.available else ("ABSENT" if d.required else "absent (facultatif)")
+            rows.append((d.name, f"{state} — {d.role} ({d.detail})"
+                         + ("" if d.available else f" — paquet : {d.package}"), "" if d.available or not d.required else "warn"))
+
+        def size_of(path):
+            total = 0
+            for dp, _dn, fn in os.walk(path):
+                for f in fn:
+                    try:
+                        total += os.path.getsize(os.path.join(dp, f))
+                    except OSError:
+                        pass
+            return total
+        rows += [("#", "Stockage local (jamais dans les sources)"),
+                 ("Cache", f"{CACHE_DIR} — {format_size(size_of(CACHE_DIR))}"),
+                 ("Préférences", CONFIG_PATH), ("Favoris et tags", ANNOTATIONS_PATH),
+                 ("Albums virtuels", self.collections.path)]
+        rows.append(("#", "Source courante"))
+        if self.mode == MODE_LIBRARY:
+            meta = self.cache.read_meta()
+            rows += [("Bibliothèque", self.library.root), ("Type", self.library.kind or "inconnu"),
+                     ("Accessible", "oui" if self.library.is_available() else "non (disque débranché ?)",
+                      "" if self.library.is_available() else "warn"),
+                     ("Index", f"{meta.get('photo_count', '?')} photos, construit le "
+                               f"{meta.get('built_at', '—').replace('T', ' à ')}")]
+        else:
+            rows += [("Dossier", self.library.root or "—")]
+        total, analysed, with_exif = self.metadata_coverage()
+        rows.append(("Métadonnées analysées", f"{format_count(analysed)} / {format_count(total)} (dont "
+                                               f"{format_count(with_exif)} avec EXIF)"))
+        try:
+            missing = self.collections.missing_refs()
+            albums = self.collections.albums()
+            rows += [("#", "Collections"), ("Albums virtuels", format_count(sum(1 for a in albums if a.kind == "manual"))),
+                     ("Albums intelligents", format_count(sum(1 for a in albums if a.kind == "smart"))),
+                     ("Recherches enregistrées", format_count(len(self.collections.searches()))),
+                     ("Références introuvables", format_count(len(missing)), "warn" if missing else "")]
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            rows.append(("Collections", f"illisibles : {exc}", "warn"))
+        InfoDialog(self, self.root, "Diagnostic", "Diagnostic d'iphotor", f"iphotor {APP_VERSION}", rows, icon="info")
+
+    def clean_obsolete_caches(self) -> None:
+        """Supprime les caches de bibliothèques qui n'existent plus et ne sont pas récentes (cache seulement)."""
+        keep = {os.path.abspath(p) for p in self.settings.recent} | {self.library.root}
+        victims = []
+        try:
+            names = os.listdir(CACHE_DIR)
+        except OSError:
+            names = []
+        for name in names:
+            d = os.path.join(CACHE_DIR, name)
+            idx = os.path.join(d, "index.sqlite3")
+            if not os.path.isfile(idx):
+                continue
+            try:
+                c = sqlite3.connect(f"file:{idx}?mode=ro", uri=True)
+                root = dict(c.execute("SELECT key, value FROM meta").fetchall()).get("library_root", "")
+                c.close()
+            except sqlite3.Error:
+                root = ""
+            if root and root not in keep and not os.path.exists(root):
+                victims.append((d, root))
+        if not victims:
+            messagebox.showinfo("Caches obsolètes", "Aucun cache obsolète : chaque cache correspond à une bibliothèque "
+                                "récente ou encore présente.", parent=self.root)
+            return
+        if not messagebox.askyesno("Caches obsolètes", "Supprimer les caches (index et miniatures) de ces "
+                                   "bibliothèques introuvables ?\n\n" + "\n".join(r for _d, r in victims[:15])
+                                   + "\n\nLes bibliothèques elles-mêmes ne sont pas concernées.", parent=self.root):
+            return
+        for d, _r in victims:
+            if storage.is_inside(d, CACHE_DIR) and os.path.realpath(d) != os.path.realpath(CACHE_DIR):
+                shutil.rmtree(d, ignore_errors=True)
+        self._set_status(f"{plural(len(victims), 'cache obsolète supprimé', 'caches obsolètes supprimés')}.")
 
     # -- menus -------------------------------------------------------------------
     def clear_thumb_cache(self) -> None:
@@ -6299,6 +9713,12 @@ class MainWindow:
         self.loader.shutdown()
         self._close_db()
         self.annotations.close()
+        self.collections.close()
+        try:   # annule les rappels after() en attente (pas d'erreur Tcl après la fermeture)
+            for job in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+                self.root.tk.call("after", "cancel", job)
+        except tk.TclError:
+            pass
         self.root.destroy()
 
 
@@ -6434,6 +9854,8 @@ def main() -> int:
                     help="chemin de la bibliothèque iPhoto (défaut : la dernière ouverte, "
                          f"sinon {DEFAULT_LIBRARY})")
     ap.add_argument("--reindexer", action="store_true", help="reconstruire l'index local")
+    ap.add_argument("--diagnostic", action="store_true",
+                    help="dépendances facultatives et emplacements des données (sans interface graphique)")
     ap.add_argument("--verifier", action="store_true",
                     help="vérifier la cohérence de l'index (sans interface graphique)")
     args = ap.parse_args()
@@ -6449,6 +9871,26 @@ def main() -> int:
     except (PermissionError, OSError) as exc:
         print(f"Erreur : impossible de préparer le cache local : {exc}", file=sys.stderr)
         return 2
+
+    if args.diagnostic:
+        print(f"iphotor {APP_VERSION} — diagnostic\n")
+        for line in depcheck.report_lines():
+            print("  " + line)
+        print(f"\n  Cache            : {CACHE_DIR}\n  Préférences      : {CONFIG_PATH}\n"
+              f"  Favoris et tags  : {ANNOTATIONS_PATH}\n"
+              f"  Albums virtuels  : {os.path.join(storage.data_root(), vcoll.DB_NAME)}")
+        col_path = os.path.join(storage.data_root(), vcoll.DB_NAME)
+        if os.path.isfile(col_path):
+            try:
+                col = vcoll.Collections(col_path)
+                print(f"  Albums virtuels : {len(col.albums('manual'))}, intelligents : {len(col.albums('smart'))}, "
+                      f"références introuvables : {len(col.missing_refs())}")
+                col.close()
+            except Exception as exc:
+                print(f"  Collections illisibles : {exc}")
+        else:
+            print("  Aucun album virtuel créé pour l'instant.")
+        return 0
 
     if args.verifier or (args.reindexer and tk is None):
         if args.reindexer or not cache.is_valid():
