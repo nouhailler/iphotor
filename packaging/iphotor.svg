@@ -1,7 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <rect x="8" y="8" width="112" height="112" rx="24" fill="#2a2d31"/>
-  <rect x="22" y="30" width="84" height="64" rx="8" fill="#4a9eff"/>
-  <circle cx="46" cy="50" r="9" fill="#ffd34d"/>
-  <path d="M22 86 L50 62 L66 76 L82 60 L106 82 L106 86 Q106 94 98 94 L30 94 Q22 94 22 86 Z" fill="#1f2124" opacity="0.85"/>
-  <rect x="22" y="100" width="84" height="6" rx="3" fill="#9aa0a6"/>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5A93E2"/>
+      <stop offset="1" stop-color="#2E64B4"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="29" fill="url(#g)"/>
+  <circle cx="45.9" cy="44.8" r="11.7" fill="#FFD666"/>
+  <path d="M18.7 101.3 L50.7 66.7 L69.3 85.3 L84.3 70.4 L109.3 101.3 Z" fill="#FFFFFF" fill-opacity="0.94"/>
 </svg>

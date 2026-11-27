@@ -4,7 +4,7 @@
 iphotor — Explorateur en lecture seule d'une ancienne bibliothèque iPhoto ou Photos (1 à 4),
 et de n'importe quel dossier d'images (mode « Explorer un dossier »).
 
-Version 1.4
+Version 1.5
 
 Principe fondamental : la bibliothèque iPhoto et les dossiers consultés ne sont JAMAIS modifiés.
   * Tous les fichiers de la bibliothèque sont ouverts en lecture seule ("rb").
@@ -15,6 +15,9 @@ Principe fondamental : la bibliothèque iPhoto et les dossiers consultés ne son
   * Les favoris et les tags sont enregistrés dans ~/.local/share/iphotor/annotations.sqlite3.
   * Les copies (« Copier vers un dossier… ») ne lisent que les fichiers sources ; elles sont
     refusées vers une bibliothèque ou un dossier consulté et ne remplacent jamais un fichier.
+
+Interface (1.5) : design system centralisé (PALETTES / COLORS, Theme, Icons) ; thème clair
+par défaut et thème sombre facultatif ; icônes vectorielles dessinées localement avec Pillow.
 
 Utilisation :
     ./iphotor.py                       interface graphique
@@ -31,6 +34,7 @@ import datetime as _dt
 import hashlib
 import io
 import json
+import math
 import os
 import plistlib
 import queue
@@ -57,7 +61,7 @@ except ImportError:  # pragma: no cover - dépend de l'installation
     tk = None  # type: ignore
 
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageDraw, ImageOps
     Image.MAX_IMAGE_PIXELS = 400_000_000  # grands scans tolérés
 except ImportError:  # pragma: no cover
     Image = None  # type: ignore
@@ -73,7 +77,7 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 APP_NAME = "iphotor"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 # Emplacement par défaut (nom standard sous macOS) ; sinon, choisir via « Ouvrir une bibliothèque ».
 DEFAULT_LIBRARY = os.path.expanduser("~/Pictures/iPhoto Library")
@@ -94,7 +98,7 @@ PAGE_SIZE = 100            # nombre maximal de photos par page
 THUMB_SIZE = 160           # taille d'affichage des vignettes (px)
 THUMB_CACHE_SIZE = 200     # taille des vignettes stockées dans le cache
 TILE_W = 184
-TILE_H = 214
+TILE_H = 228
 THUMB_WORKERS = 4
 
 APPLE_EPOCH = _dt.datetime(2001, 1, 1)   # origine des « TimerInterval »
@@ -1136,6 +1140,7 @@ class Settings:
         self.copy_dest: str = ""
         self.copy_original: bool = False
         self.copy_open: bool = False
+        self.theme: str = "light"
         self.load()
 
     def load(self) -> None:
@@ -1153,6 +1158,8 @@ class Settings:
             self.copy_dest = _as_str(data.get("copy_dest"))
             self.copy_original = bool(data.get("copy_original", False))
             self.copy_open = bool(data.get("copy_open", False))
+            theme = _as_str(data.get("theme"))
+            self.theme = theme if theme in ("light", "dark") else "light"
 
     def save(self) -> None:
         try:
@@ -1162,7 +1169,8 @@ class Settings:
                 json.dump({"last_library": self.last_library, "recent": self.recent,
                            "last_folder": self.last_folder, "folder_recursive": self.folder_recursive,
                            "folder_sort": self.folder_sort, "copy_dest": self.copy_dest,
-                           "copy_original": self.copy_original, "copy_open": self.copy_open},
+                           "copy_original": self.copy_original, "copy_open": self.copy_open,
+                           "theme": self.theme},
                           fh, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
         except OSError as exc:
@@ -2585,33 +2593,721 @@ class CopyTask:
 # Interface graphique
 # ---------------------------------------------------------------------------
 
-COLORS = {
-    "favorite": "#ff5c7a",
-    "bg": "#1f2124",
-    "panel": "#2a2d31",
-    "tile": "#2f3237",
-    "tile_hover": "#3b4047",
-    "text": "#e8e8e8",
-    "muted": "#9aa0a6",
-    "accent": "#4a9eff",
-    "missing": "#e5534b",
-    "video": "#f0a030",
-    "placeholder": "#3a3d42",
+# ---------------------------------------------------------------------------
+# Design system : palettes, typographie, icônes vectorielles et styles ttk
+# ---------------------------------------------------------------------------
+# Toutes les couleurs de l'interface passent par COLORS (palette courante, modifiée
+# en place lors d'un changement de thème). Les icônes et les éléments arrondis
+# (boutons, champs, cases à cocher, barres de défilement) sont dessinés localement
+# avec Pillow : aucune ressource externe, aucun accès réseau.
+
+PALETTES = {
+    "light": {
+        "bg": "#F5F6F8", "panel": "#FFFFFF", "footer": "#F8F9FB", "header": "#F5F6F8",
+        "card": "#FFFFFF", "card_border": "#E3E6EB", "card_hover_border": "#BCD0EE",
+        "well": "#EEF0F3", "placeholder": "#E2E5EA",
+        "text": "#202631", "muted": "#646F7F", "faint": "#A6AEBA",
+        "accent": "#3978D5", "accent_fill": "#3978D5", "accent_hover": "#2F6AC4",
+        "accent_pressed": "#2759A8", "accent_soft": "#E1EBFA", "accent_soft_text": "#1D54A3",
+        "on_accent": "#FFFFFF", "secondary": "#5D6D85",
+        "separator": "#E3E6EB", "field": "#F1F3F6", "field_border": "#DADEE5",
+        "button": "#FFFFFF", "button_border": "#D5DAE1", "button_hover": "#F2F4F7",
+        "button_pressed": "#E5E9EF", "ghost_hover": "#EDF0F4", "ghost_pressed": "#E1E6ED",
+        "scroll_thumb": "#CAD0D8", "scroll_thumb_hover": "#A8B0BC", "row_hover": "#F3F5F8",
+        "favorite": "#DE3F5C", "missing": "#CF3F3B", "video": "#D97F16", "star": "#F0AE1A",
+        "success": "#2B8F5A", "viewer_bg": "#1D2026", "viewer_text": "#C7CFDA", "shadow": "#22304A",
+    },
+    "dark": {
+        "bg": "#171A21", "panel": "#202530", "footer": "#1C2029", "header": "#171A21",
+        "card": "#272E3A", "card_border": "#2E3644", "card_hover_border": "#4A6A9C",
+        "well": "#1E232C", "placeholder": "#2C3340",
+        "text": "#EDF1F7", "muted": "#A0AABA", "faint": "#6C7789",
+        "accent": "#6AA6FF", "accent_fill": "#3370CF", "accent_hover": "#3D7BDA",
+        "accent_pressed": "#2D63B6", "accent_soft": "#253957", "accent_soft_text": "#D2E3FF",
+        "on_accent": "#FFFFFF", "secondary": "#93A3BC",
+        "separator": "#2D3440", "field": "#181C24", "field_border": "#353D4B",
+        "button": "#2A313D", "button_border": "#384150", "button_hover": "#323A48",
+        "button_pressed": "#3A4352", "ghost_hover": "#2B323E", "ghost_pressed": "#343C4A",
+        "scroll_thumb": "#3D4656", "scroll_thumb_hover": "#536074", "row_hover": "#262C38",
+        "favorite": "#FF6B86", "missing": "#F06A64", "video": "#F2A145", "star": "#F7C445",
+        "success": "#5BC48A", "viewer_bg": "#111318", "viewer_text": "#C7CFDA", "shadow": "#000000",
+    },
 }
+THEMES = ("light", "dark")
+COLORS: dict[str, str] = dict(PALETTES["light"])
+
+# Polices système courantes sous Debian, par ordre de préférence.
+FONT_FAMILIES = ("Inter", "Cantarell", "Noto Sans", "Ubuntu", "Open Sans", "DejaVu Sans", "Liberation Sans")
+
+# Espacements (px) : une seule échelle pour toute l'interface.
+SPACE_XS, SPACE_S, SPACE_M, SPACE_L, SPACE_XL = 4, 8, 12, 16, 24
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+
+
+def _rgba(color: str, alpha: int = 255) -> tuple[int, int, int, int]:
+    return (*_rgb(color), alpha)
+
+
+def mix(c1: str, c2: str, t: float) -> str:
+    """Mélange deux couleurs (t = 0 : c1, t = 1 : c2)."""
+    a, b = _rgb(c1), _rgb(c2)
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def rounded_image(w: int, h: int, r: float, fill: Optional[str], border: Optional[str] = None,
+                  bw: float = 1.0, bg: Optional[str] = None, fill_alpha: int = 255,
+                  shadow: Optional[tuple[str, int, float]] = None, inset: int = 0):
+    """Rectangle arrondi anticrénelé (image PIL). bg : couleur de fond opaque, sinon transparent.
+    shadow = (couleur, opacité 0-255, flou en px) ; inset : marge réservée à l'ombre."""
+    ss = 4
+    W, H = w * ss, h * ss
+    base = Image.new("RGBA", (W, H), _rgba(bg) if bg else (0, 0, 0, 0))
+    box = [inset * ss, inset * ss, W - inset * ss - 1, H - inset * ss - 1]
+    if shadow is not None:
+        from PIL import ImageFilter
+        col, alpha, blur = shadow
+        sh = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(sh).rounded_rectangle([box[0], box[1] + ss, box[2], box[3] + ss], r * ss, fill=alpha)
+        sh = sh.filter(ImageFilter.GaussianBlur(blur * ss))
+        layer = Image.new("RGBA", (W, H), _rgba(col))
+        layer.putalpha(sh)
+        base = Image.alpha_composite(base, layer)
+    shape = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(shape)
+    if fill:
+        d.rounded_rectangle(box, r * ss, fill=_rgba(fill, fill_alpha))
+    if border:
+        d.rounded_rectangle(box, r * ss, outline=_rgba(border), width=max(1, round(bw * ss)))
+    base = Image.alpha_composite(base, shape)
+    return base.resize((w, h), Image.LANCZOS)
+
+
+class _Pen:
+    """Dessin d'icônes « au trait » sur une grille 24 × 24, suréchantillonné (anticrénelage)."""
+
+    SS = 4
+
+    def __init__(self, size: int, color: str, stroke: float = 2.0):
+        self.size = size
+        self.k = size * self.SS / 24.0
+        self.img = Image.new("RGBA", (size * self.SS, size * self.SS), (0, 0, 0, 0))
+        self.d = ImageDraw.Draw(self.img)
+        self.c = _rgba(color)
+        self.w = max(2, round(stroke * self.k))
+
+    def p(self, x: float, y: float) -> tuple[float, float]:
+        return x * self.k, y * self.k
+
+    def line(self, *pts, closed: bool = False, erase: bool = False, width: Optional[float] = None) -> None:
+        col = (0, 0, 0, 0) if erase else self.c
+        w = self.w if width is None else max(2, round(width * self.k))
+        xy = [self.p(*q) for q in pts]
+        if closed:
+            xy.append(xy[0])
+        self.d.line(xy, fill=col, width=w, joint="curve")
+        r = w / 2
+        for x, y in xy:
+            self.d.ellipse([x - r, y - r, x + r, y + r], fill=col)
+
+    def rrect(self, x0, y0, x1, y1, r, fill: bool = False, erase: bool = False) -> None:
+        col = (0, 0, 0, 0) if erase else self.c
+        box = [*self.p(x0, y0), *self.p(x1, y1)]
+        if fill:
+            self.d.rounded_rectangle(box, r * self.k, fill=col)
+        else:
+            self.d.rounded_rectangle(box, r * self.k, outline=col, width=self.w)
+
+    def circle(self, cx, cy, r, fill: bool = False, erase: bool = False) -> None:
+        col = (0, 0, 0, 0) if erase else self.c
+        box = [*self.p(cx - r, cy - r), *self.p(cx + r, cy + r)]
+        if fill:
+            self.d.ellipse(box, fill=col)
+        else:
+            self.d.ellipse(box, outline=col, width=self.w)
+
+    def poly(self, pts, erase: bool = False) -> None:
+        self.d.polygon([self.p(*q) for q in pts], fill=(0, 0, 0, 0) if erase else self.c)
+
+    def arc(self, cx, cy, r, start, end) -> None:
+        box = [*self.p(cx - r, cy - r), *self.p(cx + r, cy + r)]
+        self.d.arc(box, start, end, fill=self.c, width=self.w)
+
+    def image(self):
+        return self.img.resize((self.size, self.size), Image.LANCZOS)
+
+
+def _heart_points(cx=12.0, cy=12.6, s=0.56, n=64):
+    pts = []
+    for i in range(n):
+        t = 2 * math.pi * i / n
+        x = 16 * math.sin(t) ** 3
+        y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        pts.append((cx + x * s, cy - y * s - 1.2))
+    return pts
+
+
+def _star_points(cx=12.0, cy=12.4, ro=9.5, ri=4.0):
+    return [(cx + (ro if i % 2 == 0 else ri) * math.sin(math.pi * i / 5),
+             cy - (ro if i % 2 == 0 else ri) * math.cos(math.pi * i / 5)) for i in range(10)]
+
+
+def draw_icon(name: str, size: int, color: str):
+    """Renvoie l'icône `name` (image PIL RGBA) dans la couleur demandée."""
+    pen = _Pen(size, color, stroke=2.0 if size <= 18 else 1.8)
+    P = pen
+    if name == "photos":
+        P.rrect(3, 3, 21, 21, 3.5)
+        P.circle(9, 9, 2)
+        P.line((21, 15.5), (16, 10.5), (5, 21))
+    elif name == "album":
+        P.rrect(7, 7, 21, 20, 2.5)
+        P.line((4, 16.5), (4, 6), (5.5, 4.5), (16.5, 4.5))
+        P.line((7.5, 18.5), (12, 14), (14.5, 16.5), (17, 14), (20.5, 17.5))
+    elif name == "smart":
+        P.rrect(3, 4, 21, 20, 3)
+        P.poly(_star_points(12, 12.2, 5.6, 2.0))
+    elif name == "event":
+        P.rrect(3, 5, 21, 21, 3)
+        P.line((3.5, 10), (20.5, 10))
+        P.line((8, 3), (8, 6.5))
+        P.line((16, 3), (16, 6.5))
+        P.circle(8.5, 15, 1.4, fill=True)
+    elif name == "folder":
+        P.line((3, 6.5), (3, 18), (4.5, 19.5), (19.5, 19.5), (21, 18), (21, 10), (19.5, 8.5),
+               (12.5, 8.5), (10.5, 5), (4.5, 5), closed=True)
+    elif name == "folder_open":
+        P.line((3, 18.5), (3, 6.5), (4.5, 5), (10, 5), (12, 8), (18, 8), (19.5, 9.5), (19.5, 11))
+        P.line((3, 18.5), (6, 11.5), (22, 11.5), (19, 19.5), (4.5, 19.5), closed=True)
+    elif name == "folder_arrow":
+        P.line((3, 6.5), (3, 18), (4.5, 19.5), (19.5, 19.5), (21, 18), (21, 10), (19.5, 8.5),
+               (12.5, 8.5), (10.5, 5), (4.5, 5), closed=True)
+        P.line((8.5, 14), (15, 14))
+        P.line((12.5, 11.5), (15, 14), (12.5, 16.5))
+    elif name in ("heart", "heart_fill"):
+        pts = _heart_points()
+        if name == "heart_fill":
+            P.poly(pts)
+            P.line(*pts, closed=True)
+        else:
+            P.line(*pts, closed=True)
+    elif name == "tag":
+        P.line((3, 4.5), (4.5, 3), (11.5, 3), (21, 12.5), (21, 13.5), (13.5, 21), (12.5, 21), (3, 11.5),
+               closed=True)
+        P.circle(8, 8, 1.6, fill=True)
+    elif name == "hash":
+        P.line((9.5, 4), (7.5, 20))
+        P.line((16.5, 4), (14.5, 20))
+        P.line((4.5, 9), (19.5, 9))
+        P.line((4, 15), (19, 15))
+    elif name == "search":
+        P.circle(10.5, 10.5, 6.5)
+        P.line((15.5, 15.5), (20.5, 20.5))
+    elif name == "close":
+        P.line((6.5, 6.5), (17.5, 17.5))
+        P.line((17.5, 6.5), (6.5, 17.5))
+    elif name == "chev_left":
+        P.line((15, 5), (8, 12), (15, 19))
+    elif name == "chev_right":
+        P.line((9, 5), (16, 12), (9, 19))
+    elif name == "chev_down":
+        P.line((6, 9), (12, 15), (18, 9))
+    elif name == "info":
+        P.circle(12, 12, 9)
+        P.line((12, 11), (12, 16.5))
+        P.circle(12, 7.6, 1.4, fill=True)
+    elif name == "copy":
+        P.rrect(8, 8, 21, 21, 2.5)
+        P.line((4.5, 16), (3, 14.5), (3, 4.5), (4.5, 3), (14.5, 3), (16, 4.5))
+    elif name == "file":
+        P.line((6.5, 3), (14, 3), (19, 8), (19, 19.5), (17.5, 21), (6.5, 21), (5, 19.5), (5, 4.5), closed=True)
+        P.line((14, 3.5), (14, 8), (18.5, 8))
+        P.line((8.5, 13), (15.5, 13))
+        P.line((8.5, 17), (13, 17))
+    elif name == "external":
+        P.line((14, 3), (21, 3), (21, 10))
+        P.line((21, 3), (11.5, 12.5))
+        P.line((18, 14), (18, 19.5), (16.5, 21), (4.5, 21), (3, 19.5), (3, 7.5), (4.5, 6), (10, 6))
+    elif name == "video":
+        P.circle(12, 12, 9)
+        P.poly([(10, 8.2), (16.2, 12), (10, 15.8)])
+    elif name == "play":
+        P.poly([(7, 4.5), (19.5, 12), (7, 19.5)])
+        P.line((7, 4.5), (19.5, 12), (7, 19.5), closed=True, width=1.5)
+    elif name == "warning":
+        P.line((12, 3.5), (21.5, 20), (2.5, 20), closed=True)
+        P.line((12, 9.5), (12, 13.8))
+        P.circle(12, 16.9, 1.3, fill=True)
+    elif name == "image_off":
+        P.rrect(3, 3, 21, 21, 3.5)
+        P.circle(9, 9, 2)
+        P.line((21, 15.5), (16, 10.5), (5, 21))
+        P.line((2, 2), (22, 22), erase=True, width=5)
+        P.line((3, 3), (21, 21))
+    elif name == "library":
+        P.rrect(3, 3, 10.5, 10.5, 2)
+        P.rrect(13.5, 3, 21, 10.5, 2)
+        P.rrect(3, 13.5, 10.5, 21, 2)
+        P.rrect(13.5, 13.5, 21, 21, 2)
+    elif name == "sun":
+        P.circle(12, 12, 4.2)
+        for i in range(8):
+            a = math.pi * i / 4
+            P.line((12 + 7.2 * math.cos(a), 12 + 7.2 * math.sin(a)), (12 + 9.6 * math.cos(a), 12 + 9.6 * math.sin(a)))
+    elif name == "moon":
+        P.circle(12, 12, 8.5, fill=True)
+        P.circle(16.5, 7.5, 6.8, fill=True, erase=True)
+        inner = _Pen(size, color)
+        inner.circle(12, 12, 8.5 - 2.0 * 1.0, fill=True)
+        inner.circle(16.5, 7.5, 6.8 + 2.0 * 1.0, fill=True, erase=True)
+        cut = inner.img.getchannel("A")
+        alpha = P.img.getchannel("A")
+        from PIL import ImageChops
+        P.img.putalpha(ImageChops.subtract(alpha, cut))
+    elif name == "lock":
+        P.rrect(5, 11, 19, 21, 2.5)
+        P.arc(12, 7.5, 4, 180, 360)
+        P.line((8, 7.5), (8, 11))
+        P.line((16, 7.5), (16, 11))
+    elif name == "star_fill":
+        P.poly(_star_points())
+    elif name == "check":
+        P.line((5, 12.5), (10, 17.5), (19, 7))
+    elif name == "dot":
+        P.circle(12, 12, 3.5, fill=True)
+    elif name == "refresh":
+        P.arc(12, 12, 8, 210, 520 - 360 + 360)
+        P.line((20, 4.5), (20, 9.5), (15, 9.5))
+    else:  # icône inconnue : carré discret
+        P.rrect(5, 5, 19, 19, 3)
+    return pen.image()
+
+
+def draw_logo(size: int, accent: str):
+    """Logo d'iphotor : carré arrondi bleu, photo stylisée."""
+    ss = 4
+    S = size * ss
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    grad = Image.new("RGBA", (S, S))
+    top, bottom = _rgb(mix(accent, "#7FB2FF", 0.35)), _rgb(mix(accent, "#1E3F7A", 0.25))
+    gd = ImageDraw.Draw(grad)
+    for y in range(S):
+        t = y / S
+        gd.line([(0, y), (S, y)], fill=tuple(round(top[i] + (bottom[i] - top[i]) * t) for i in range(3)) + (255,))
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], S * 0.24, fill=255)
+    img.paste(grad, (0, 0), mask)
+    d = ImageDraw.Draw(img)
+    k = S / 24
+    d.ellipse([8.6 * k - 2.2 * k, 8.4 * k - 2.2 * k, 8.6 * k + 2.2 * k, 8.4 * k + 2.2 * k], fill=(255, 214, 102, 255))
+    d.polygon([(3.5 * k, 19 * k), (9.5 * k, 12.5 * k), (13 * k, 16 * k), (15.8 * k, 13.2 * k), (20.5 * k, 19 * k)],
+              fill=(255, 255, 255, 240))
+    return img.resize((size, size), Image.LANCZOS)
+
+
+class Icons:
+    """Icônes de l'interface (PhotoImage), regénérées en place lors d'un changement de thème."""
+
+    def __init__(self, master):
+        self.master = master
+        self._cache: dict[tuple[str, int, str], object] = {}
+
+    def get(self, name: str, size: int = 16, role: str = "secondary"):
+        key = (name, size, role)
+        img = self._cache.get(key)
+        if img is None:
+            img = ImageTk.PhotoImage(self._render(*key), master=self.master)
+            self._cache[key] = img
+        return img
+
+    @staticmethod
+    def _render(name: str, size: int, role: str):
+        if name == "logo":
+            return draw_logo(size, COLORS["accent_fill"])
+        color = "#FFFFFF" if role == "white" else COLORS.get(role, role if role.startswith("#") else COLORS["secondary"])
+        return draw_icon(name, size, color)
+
+    def refresh(self) -> None:
+        for key, img in self._cache.items():
+            img.paste(self._render(*key))
+
+
+class Theme:
+    """Styles ttk de l'application (clam personnalisé + éléments arrondis dessinés par Pillow)."""
+
+    def __init__(self, root, fonts: dict):
+        self.root = root
+        self.fonts = fonts
+        self.style = ttk.Style(root)
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+        self._images: dict[str, object] = {}
+        self._created = False
+
+    # -- images des éléments ---------------------------------------------------
+    def _img(self, key: str, pil) -> object:
+        img = self._images.get(key)
+        if img is None:
+            img = ImageTk.PhotoImage(pil, master=self.root)
+            self._images[key] = img
+        else:
+            img.paste(pil)
+        return img
+
+    def _element_images(self) -> None:
+        c = COLORS
+        R = 7
+        n = 2 * R + 6
+        btn = lambda fill, border, bg="panel": rounded_image(n, n, R, c[fill], c[border] if border else None, 1, bg=c[bg])
+        self._img("btn", btn("button", "button_border"))
+        self._img("btn_hover", btn("button_hover", "button_border"))
+        self._img("btn_pressed", btn("button_pressed", "button_border"))
+        self._img("btn_disabled", btn("panel", "separator"))
+        self._img("btn_focus", rounded_image(n, n, R, c["button"], c["accent"], 1.6, bg=c["panel"]))
+        self._img("acc", btn("accent_fill", None))
+        self._img("acc_hover", btn("accent_hover", None))
+        self._img("acc_pressed", btn("accent_pressed", None))
+        self._img("acc_disabled", rounded_image(n, n, R, mix(c["accent_fill"], c["panel"], 0.55), None, bg=c["panel"]))
+        self._img("acc_focus", rounded_image(n, n, R, c["accent_fill"], mix(c["accent_fill"], c["text"], 0.45), 1.6,
+                                             bg=c["panel"]))
+        self._img("ghost", rounded_image(n, n, R, c["panel"], None, bg=c["panel"]))
+        self._img("ghost_hover", btn("ghost_hover", None))
+        self._img("ghost_pressed", btn("ghost_pressed", None))
+        self._img("ghost_focus", rounded_image(n, n, R, c["panel"], c["accent"], 1.4, bg=c["panel"]))
+        # Sélecteur de mode (contrôle segmenté)
+        self._img("track", rounded_image(n, n, R + 1, c["field"], c["separator"], 1, bg=c["panel"]))
+        self._img("seg", rounded_image(n, n, R - 1, c["field"], None, bg=c["field"]))
+        self._img("seg_hover", rounded_image(n, n, R - 1, mix(c["field"], c["text"], 0.06), None, bg=c["field"]))
+        self._img("seg_sel", rounded_image(n, n, R - 1, c["panel"], c["button_border"], 1, bg=c["field"]))
+        # Champ de recherche
+        self._img("field", rounded_image(n, n, R + 1, c["field"], c["field_border"], 1, bg=c["panel"]))
+        self._img("field_focus", rounded_image(n, n, R + 1, c["panel"], c["accent"], 1.6, bg=c["panel"]))
+        # Cases à cocher et boutons radio (16 px)
+        s = 18
+        box = lambda fill, border: rounded_image(s, s, 4.5, c[fill], c[border] if border else None, 1.2,
+                                                 bg=c["panel"], inset=1)
+        chk = box("accent_fill", None)
+        chk.alpha_composite(draw_icon("check", s, "#FFFFFF"))
+        def margin(im):   # espace entre la case et son libellé
+            out = Image.new("RGBA", (s + 7, s), _rgba(c["panel"]))
+            out.alpha_composite(im.convert("RGBA"))
+            return out
+        self._img("chk_off", margin(box("button", "button_border")))
+        self._img("chk_hover", margin(box("button", "accent")))
+        self._img("chk_on", margin(chk))
+        self._img("chk_dis", margin(box("panel", "separator")))
+        rad = lambda fill, border, bw=1.2: rounded_image(s, s, 8, c[fill], c[border] if border else None, bw,
+                                                         bg=c["panel"], inset=1)
+        on = rad("accent_fill", None)
+        dot = rounded_image(s, s, 3, "#FFFFFF", None, inset=6)
+        on.alpha_composite(dot)
+        self._img("rad_off", margin(rad("button", "button_border")))
+        self._img("rad_hover", margin(rad("button", "accent")))
+        self._img("rad_on", margin(on))
+        self._img("rad_dis", margin(rad("panel", "separator")))
+        # Indicateurs de l'arborescence (transparents)
+        self._img("tree_closed", draw_icon("chev_right", 14, c["faint"]))
+        self._img("tree_open", draw_icon("chev_down", 14, c["muted"]))
+        self._img("tree_leaf", Image.new("RGBA", (14, 14), (0, 0, 0, 0)))
+        # Barres de défilement fines
+        for surf in ("panel", "bg"):
+            for st, col in (("", "scroll_thumb"), ("_hover", "scroll_thumb_hover")):
+                self._img(f"thumb_{surf}{st}", rounded_image(12, 24, 3.5, c[col], None, bg=c[surf] if surf != "bg"
+                                                             else c["bg"], inset=3))
+            self._img(f"trough_{surf}", Image.new("RGB", (12, 12), _rgb(c[surf])))
+        # Barre de progression
+        for surf in ("panel", "bg"):
+            self._img(f"ptrough_{surf}", rounded_image(16, 8, 4, mix(c[surf], c["text"], 0.1), None, bg=c[surf]))
+            self._img(f"pbar_{surf}", rounded_image(16, 8, 4, c["accent_fill"], None, bg=c[surf]))
+
+    def _create_elements(self) -> None:
+        st = self.style
+        I = self._images
+        ce = st.element_create
+        ce("Iph.Button.bg", "image", I["btn"], ("disabled", I["btn_disabled"]), ("pressed", I["btn_pressed"]),
+           ("active", I["btn_hover"]), ("focus", I["btn_focus"]), border=8, padding=3, sticky="nsew")
+        ce("Iph.Accent.bg", "image", I["acc"], ("disabled", I["acc_disabled"]), ("pressed", I["acc_pressed"]),
+           ("active", I["acc_hover"]), ("focus", I["acc_focus"]), border=8, padding=3, sticky="nsew")
+        ce("Iph.Ghost.bg", "image", I["ghost"], ("pressed", I["ghost_pressed"]), ("active", I["ghost_hover"]),
+           ("focus", I["ghost_focus"]), border=8, padding=3, sticky="nsew")
+        ce("Iph.Track.bg", "image", I["track"], border=9, padding=0, sticky="nsew")
+        ce("Iph.Seg.bg", "image", I["seg"], ("selected", I["seg_sel"]), ("active", I["seg_hover"]),
+           border=8, padding=3, sticky="nsew")
+        ce("Iph.Field.bg", "image", I["field"], border=9, padding=0, sticky="nsew")
+        ce("Iph.FieldFocus.bg", "image", I["field_focus"], border=9, padding=0, sticky="nsew")
+        ce("Iph.Check.indicator", "image", I["chk_off"], ("disabled", I["chk_dis"]), ("selected", I["chk_on"]),
+           ("active", I["chk_hover"]), sticky="")
+        ce("Iph.Radio.indicator", "image", I["rad_off"], ("disabled", I["rad_dis"]), ("selected", I["rad_on"]),
+           ("active", I["rad_hover"]), sticky="")
+        ce("Iph.Treeitem.indicator", "image", I["tree_closed"], ("user1", "!user2", I["tree_open"]),
+           ("user2", I["tree_leaf"]), sticky="", padding=(0, 0, 4, 0))
+        for surf in ("panel", "bg"):
+            ce(f"Iph.{surf}.thumb", "image", I[f"thumb_{surf}"], ("active", I[f"thumb_{surf}_hover"]),
+               ("pressed", I[f"thumb_{surf}_hover"]), border=(0, 8), sticky="nsew")
+            ce(f"Iph.{surf}.trough", "image", I[f"trough_{surf}"], border=0, sticky="nsew")
+            ce(f"Iph.{surf}.ptrough", "image", I[f"ptrough_{surf}"], border=4, sticky="nsew")
+            ce(f"Iph.{surf}.pbar", "image", I[f"pbar_{surf}"], border=4, sticky="nsew")
+
+        def btn_layout(element):
+            return [(element, {"sticky": "nsew", "children": [
+                ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})]
+
+        st.layout("TButton", btn_layout("Iph.Button.bg"))
+        st.layout("Accent.TButton", btn_layout("Iph.Accent.bg"))
+        st.layout("Ghost.TButton", btn_layout("Iph.Ghost.bg"))
+        st.layout("Icon.TButton", btn_layout("Iph.Ghost.bg"))
+        st.layout("AccentIcon.TButton", btn_layout("Iph.Accent.bg"))
+        st.layout("Segment.TFrame", [("Iph.Track.bg", {"sticky": "nsew"})])
+        st.layout("Search.TFrame", [("Iph.Field.bg", {"sticky": "nsew"})])
+        st.layout("SearchFocus.TFrame", [("Iph.FieldFocus.bg", {"sticky": "nsew"})])
+        st.layout("Segment.Toolbutton", [("Iph.Seg.bg", {"sticky": "nsew", "children": [
+            ("Toolbutton.padding", {"sticky": "nsew", "children": [("Toolbutton.label", {"sticky": "nsew"})]})]})])
+        st.layout("Search.TEntry", [("Entry.field", {"sticky": "nsew", "border": "1", "children": [
+            ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
+        st.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+            ("Iph.Check.indicator", {"side": "left", "sticky": ""}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Checkbutton.label", {"sticky": "nswe"})]})]})])
+        st.layout("TRadiobutton", [("Radiobutton.padding", {"sticky": "nswe", "children": [
+            ("Iph.Radio.indicator", {"side": "left", "sticky": ""}),
+            ("Radiobutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Radiobutton.label", {"sticky": "nswe"})]})]})])
+        st.layout("Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+            ("Iph.Treeitem.indicator", {"side": "left", "sticky": ""}),
+            ("Treeitem.image", {"side": "left", "sticky": ""}),
+            ("Treeitem.text", {"sticky": "nswe"})]})])
+        for surf, name in (("panel", "Vertical.TScrollbar"), ("bg", "Grid.Vertical.TScrollbar")):
+            st.layout(name, [(f"Iph.{surf}.trough", {"sticky": "ns", "children": [
+                (f"Iph.{surf}.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        for surf, name in (("panel", "Horizontal.TProgressbar"), ("bg", "Grid.Horizontal.TProgressbar")):
+            st.layout(name, [(f"Iph.{surf}.ptrough", {"sticky": "nswe", "children": [
+                (f"Iph.{surf}.pbar", {"side": "left", "sticky": "ns"})]})])
+
+    # -- application ---------------------------------------------------------------
+    def apply(self) -> None:
+        """(Ré)applique la palette COLORS courante à tous les styles."""
+        self._element_images()
+        if not self._created:
+            self._create_elements()
+            self._created = True
+        c, f = COLORS, self.fonts
+        st = self.style
+        st.configure(".", background=c["panel"], foreground=c["text"], fieldbackground=c["field"],
+                     bordercolor=c["button_border"], lightcolor=c["panel"], darkcolor=c["panel"],
+                     troughcolor=c["field"], selectbackground=c["accent_soft"], selectforeground=c["text"],
+                     insertcolor=c["text"], focuscolor=c["accent"], font=f["base"])
+        st.map(".", foreground=[("disabled", c["faint"])])
+        for name, bg in (("TFrame", "panel"), ("Panel.TFrame", "panel"), ("Bg.TFrame", "bg"),
+                         ("Footer.TFrame", "footer"), ("Header.TFrame", "header"), ("Field.TFrame", "field")):
+            st.configure(name, background=c[bg])
+        labels = {
+            "TLabel": ("panel", "text", "base"), "Panel.TLabel": ("panel", "text", "base"),
+            "Muted.TLabel": ("panel", "muted", "base"), "Small.TLabel": ("panel", "muted", "small"),
+            "Favorite.TLabel": ("panel", "favorite", "base"), "Title.TLabel": ("panel", "text", "title"),
+            "Brand.TLabel": ("panel", "text", "brand"), "Section.TLabel": ("panel", "muted", "caption"),
+            "Heading.TLabel": ("header", "text", "h1"), "Subheading.TLabel": ("header", "muted", "base"),
+            "HeaderMuted.TLabel": ("header", "muted", "small"), "Header.TLabel": ("header", "text", "base"),
+            "Status.TLabel": ("footer", "muted", "small"), "StatusIcon.TLabel": ("footer", "muted", "small"),
+            "Footer.TLabel": ("footer", "muted", "small"), "Field.TLabel": ("field", "muted", "base"),
+            "Error.TLabel": ("panel", "missing", "base"), "Strong.TLabel": ("panel", "text", "bold"),
+            "Chip.TLabel": ("accent_soft", "accent_soft_text", "small"),
+            "FavChip.TLabel": ("panel", "favorite", "bold"),
+        }
+        for name, (bg, fg, font) in labels.items():
+            st.configure(name, background=c[bg], foreground=c[fg], font=f[font])
+        st.configure("Chip.TLabel", padding=(8, 2))
+        for name in ("TButton", "Accent.TButton", "Ghost.TButton", "Icon.TButton"):
+            st.configure(name, font=f["base"], anchor="center", relief="flat", borderwidth=0)
+        st.configure("TButton", foreground=c["text"], padding=(12, 3))
+        st.configure("Accent.TButton", foreground=c["on_accent"], padding=(14, 3), font=f["bold"])
+        st.map("Accent.TButton", foreground=[("disabled", mix(c["on_accent"], c["panel"], 0.25))])
+        st.configure("AccentIcon.TButton", padding=(8, 3), width=0)
+        st.configure("TButton", width=-9)
+        st.configure("Accent.TButton", width=-9)
+        st.configure("Ghost.TButton", foreground=c["text"], padding=(8, 4), width=0)
+        st.configure("Icon.TButton", foreground=c["text"], padding=(5, 4), width=0)
+        st.map("TButton", foreground=[("disabled", c["faint"])])
+        st.map("Ghost.TButton", foreground=[("disabled", c["faint"])])
+        st.map("Icon.TButton", foreground=[("disabled", c["faint"])])
+        st.configure("Segment.TFrame", padding=3)
+        st.configure("Segment.Toolbutton", foreground=c["muted"], padding=(10, 2), font=f["base"], anchor="center",
+                     width=0)
+        st.map("Segment.Toolbutton", foreground=[("selected", c["text"]), ("active", c["text"])],
+               font=[("selected", f["bold"])])
+        st.configure("Search.TFrame", padding=(8, 1, 3, 1))
+        st.configure("SearchFocus.TFrame", padding=(8, 1, 3, 1))
+        st.configure("Search.TEntry", fieldbackground=c["field"], foreground=c["text"], padding=(4, 4),
+                     insertcolor=c["text"], insertwidth=1, bordercolor=c["field"], lightcolor=c["field"],
+                     darkcolor=c["field"])
+        st.map("Search.TEntry", fieldbackground=[("focus", c["panel"])], bordercolor=[("focus", c["panel"])],
+               lightcolor=[("focus", c["panel"])], darkcolor=[("focus", c["panel"])])
+        st.configure("SearchIcon.TLabel", background=c["field"], foreground=c["muted"])
+        st.configure("SearchIconFocus.TLabel", background=c["panel"], foreground=c["muted"])
+        st.configure("SearchClear.TButton", padding=(4, 3))
+        st.layout("SearchClear.TButton", [("Button.padding", {"sticky": "nsew", "children": [
+            ("Button.label", {"sticky": "nsew"})]})])
+        st.configure("SearchClear.TButton", background=c["field"])
+        st.map("SearchClear.TButton", background=[("active", c["ghost_hover"])])
+        st.configure("SearchClearFocus.TButton", padding=(4, 3), background=c["panel"])
+        st.layout("SearchClearFocus.TButton", st.layout("SearchClear.TButton"))
+        st.map("SearchClearFocus.TButton", background=[("active", c["ghost_hover"])])
+        st.configure("TEntry", fieldbackground=c["panel"], foreground=c["text"], padding=(8, 5),
+                     bordercolor=c["field_border"], lightcolor=c["field_border"], darkcolor=c["field_border"])
+        st.map("TEntry", bordercolor=[("focus", c["accent"])], lightcolor=[("focus", c["accent"])],
+               darkcolor=[("focus", c["accent"])])
+        st.configure("TCombobox", fieldbackground=c["button"], background=c["button"], foreground=c["text"],
+                     bordercolor=c["button_border"], lightcolor=c["button"], darkcolor=c["button"],
+                     arrowcolor=c["muted"], arrowsize=12, padding=(8, 4))
+        st.map("TCombobox", fieldbackground=[("readonly", c["button"])], foreground=[("readonly", c["text"])],
+               background=[("active", c["button_hover"]), ("readonly", c["button"])],
+               bordercolor=[("focus", c["accent"])], selectbackground=[("readonly", c["button"])],
+               selectforeground=[("readonly", c["text"])], arrowcolor=[("active", c["text"])])
+        self.root.option_add("*TCombobox*Listbox.background", c["panel"])
+        self.root.option_add("*TCombobox*Listbox.foreground", c["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", c["accent_soft"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", c["accent_soft_text"])
+        self.root.option_add("*TCombobox*Listbox.font", f["base"])
+        self.root.option_add("*TCombobox*Listbox.borderWidth", 0)
+        for name in ("TCheckbutton", "TRadiobutton"):
+            st.configure(name, background=c["panel"], foreground=c["text"], padding=(0, 3), font=f["base"])
+            st.map(name, background=[("active", c["panel"])], foreground=[("disabled", c["faint"])])
+        st.configure("Treeview", background=c["panel"], fieldbackground=c["panel"], foreground=c["text"],
+                     rowheight=28, borderwidth=0, relief="flat", font=f["base"], indent=16)
+        st.map("Treeview", background=[("selected", c["accent_soft"])],
+               foreground=[("selected", c["accent_soft_text"])])
+        st.configure("Treeview.Heading", background=c["footer"], foreground=c["muted"], relief="flat",
+                     borderwidth=0, font=f["small_bold"], padding=(8, 5))
+        st.map("Treeview.Heading", background=[("active", c["button_hover"])])
+        st.configure("Sidebar.Treeview", background=c["panel"], fieldbackground=c["panel"], rowheight=30,
+                     indent=14, padding=(6, 4))
+        st.configure("Item.Treeview", rowheight=26)
+        st.layout("Sidebar.Treeview", [("Treeview.field", {"sticky": "nswe", "border": "0", "children": [
+            ("Treeview.padding", {"sticky": "nswe", "children": [("Treeview.treearea", {"sticky": "nswe"})]})]})])
+        st.configure("TSeparator", background=c["separator"], lightcolor=c["separator"],
+                     darkcolor=c["separator"], bordercolor=c["separator"])
+        st.configure("Vertical.TScrollbar", width=12, arrowsize=0)
+        st.configure("Grid.Vertical.TScrollbar", width=12, arrowsize=0)
+        st.configure("Horizontal.TProgressbar", thickness=8)
+        st.configure("Grid.Horizontal.TProgressbar", thickness=8)
+        st.configure("TPanedwindow", background=c["separator"])
+        # Menus Tk (barre de menus, menus contextuels)
+        for opt, val in (("background", c["panel"]), ("foreground", c["text"]),
+                         ("activeBackground", c["accent_soft"]), ("activeForeground", c["accent_soft_text"]),
+                         ("disabledForeground", c["faint"]), ("selectColor", c["accent"]),
+                         ("relief", "flat"), ("activeBorderWidth", 0), ("borderWidth", 1), ("font", f["base"])):
+            self.root.option_add(f"*Menu.{opt}", val)
+        # Boîtes de dialogue standard de Tk (messages, choix de dossier)
+        self.root.option_add("*Dialog.msg.font", f["base"])
+        self.root.option_add("*Dialog.dtl.font", f["base"])
+        self.root.option_add("*Background", c["panel"])
+        self.root.option_add("*Foreground", c["text"])
+        self.root.option_add("*selectBackground", c["accent_soft"])
+        self.root.option_add("*selectForeground", c["accent_soft_text"])
+        self.root.option_add("*highlightColor", c["accent"])
+        self.root.option_add("*highlightBackground", c["panel"])
+        self.root.option_add("*Listbox.background", c["panel"])
+        self.root.option_add("*Entry.background", c["panel"])
+        self.root.option_add("*Text.background", c["panel"])
+
+
+def pick_font_family(root) -> str:
+    try:
+        available = {f.lower(): f for f in tkfont.families(root)}
+    except tk.TclError:
+        available = {}
+    for fam in FONT_FAMILIES:
+        if fam.lower() in available:
+            return available[fam.lower()]
+    return tkfont.nametofont("TkDefaultFont").cget("family")
+
+
+def setup_fonts(root) -> dict:
+    """Polices de l'application : une seule famille système, hiérarchie par taille et graisse."""
+    fam = pick_font_family(root)
+    for name, size, weight in (("TkDefaultFont", 10, "normal"), ("TkTextFont", 10, "normal"),
+                               ("TkMenuFont", 10, "normal"), ("TkHeadingFont", 10, "bold"),
+                               ("TkCaptionFont", 11, "bold"), ("TkTooltipFont", 9, "normal"),
+                               ("TkSmallCaptionFont", 9, "normal"), ("TkIconFont", 10, "normal")):
+        try:
+            tkfont.nametofont(name).configure(family=fam, size=size, weight=weight)
+        except tk.TclError:
+            pass
+    base = tkfont.nametofont("TkDefaultFont")
+    mk = lambda size, weight="normal": tkfont.Font(root=root, family=fam, size=size, weight=weight)
+    return {
+        "family": fam, "base": base, "small": mk(9), "small_bold": mk(9, "bold"), "bold": mk(10, "bold"),
+        "caption": mk(8, "bold"), "title": mk(13, "bold"), "brand": mk(13, "bold"), "h1": mk(16, "bold"),
+        "big": mk(12), "badge": mk(8, "bold"),
+    }
+
+
+class Tooltip:
+    """Info-bulle discrète (utile pour les boutons réduits à leur icône)."""
+
+    def __init__(self, widget, text: str, delay: int = 600):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._job = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None) -> None:
+        self._hide()
+        self._job = self.widget.after(self.delay, self._show)
+
+    def _show(self) -> None:
+        if not self.text or not self.widget.winfo_viewable():
+            return
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.configure(bg=COLORS["text"])
+        tk.Label(tip, text=self.text, bg=COLORS["text"], fg=COLORS["panel"], padx=8, pady=3,
+                 font=tkfont.nametofont("TkTooltipFont")).pack()
+        tip.update_idletasks()
+        tip.geometry(f"+{x - tip.winfo_width() // 2}+{y}")
+        self._tip = tip
+
+    def _hide(self, _e=None) -> None:
+        if self._job:
+            self.widget.after_cancel(self._job)
+            self._job = None
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
 
 
 class PhotoViewer:
     """Fenêtre de visualisation d'une photo, avec navigation."""
 
+    # (action, libellé, icône, info-bulle avec raccourci)
+    ACTIONS = (
+        ("fav", "Favori", "heart", "Ajouter aux favoris / retirer (F)"),
+        ("tags", "Tags", "tag", "Tags de la photo (T)"),
+        ("exif", "Infos", "info", "Informations EXIF (I)"),
+        ("copy", "Copier", "copy", "Copier l'image dans le presse-papiers (Ctrl+C)"),
+        ("path", "Chemin", "file", "Copier le chemin du fichier (Ctrl+Maj+C)"),
+        ("to", "Copier vers…", "folder_arrow", "Copier vers un dossier (Ctrl+S)"),
+        ("open", "Ouvrir", "external", "Ouvrir avec l'application par défaut"),
+    )
+
     def __init__(self, app: "MainWindow"):
         self.app = app
+        icons = app.icons
         self.win = tk.Toplevel(app.root)
         self.win.title("Visualisation — iphotor")
-        self.win.configure(bg=COLORS["bg"])
+        self.win.configure(bg=COLORS["panel"])
         sw, sh = app.root.winfo_screenwidth(), app.root.winfo_screenheight()
         self.max_w, self.max_h = min(sw, 3000), min(sh, 2000)
         self.win.geometry(f"{int(sw * 0.75)}x{int(sh * 0.8)}")
-        self.win.minsize(500, 400)
+        self.win.minsize(560, 420)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
         self.ids: list[int] = []
@@ -2623,41 +3319,58 @@ class PhotoViewer:
         self.results: "queue.Queue[tuple]" = queue.Queue()
         self._resize_job = None
         self._details = ""
+        self._compact: Optional[bool] = None
 
-        # Barre de navigation
-        bar = ttk.Frame(self.win, style="Panel.TFrame", padding=(8, 6))
+        # Barre d'outils : navigation à gauche, actions sur la photo à droite
+        bar = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_M, SPACE_S))
         bar.pack(side="top", fill="x")
-        self.btn_prev = ttk.Button(bar, text="◀  Précédente", command=self.prev)
+        self.btn_prev = ttk.Button(bar, image=(icons.get("chev_left", 18, "text"), "disabled",
+                                               icons.get("chev_left", 18, "faint")),
+                                   style="Icon.TButton", command=self.prev)
         self.btn_prev.pack(side="left")
-        self.btn_next = ttk.Button(bar, text="Suivante  ▶", command=self.next)
-        self.btn_next.pack(side="left", padx=(6, 0))
-        self.pos_label = ttk.Label(bar, text="", style="Panel.TLabel")
-        self.pos_label.pack(side="left", padx=12)
-        self.btn_open = ttk.Button(bar, text="Ouvrir ↗", command=self.open_external)
-        self.btn_open.pack(side="right")
-        ttk.Button(bar, text="Copier vers…", command=lambda: self._act("to")).pack(side="right", padx=(0, 6))
-        ttk.Button(bar, text="Copier", command=lambda: self._act("copy")).pack(side="right", padx=(0, 6))
-        ttk.Button(bar, text="EXIF", command=lambda: self._act("exif")).pack(side="right", padx=(0, 6))
-        ttk.Button(bar, text="🏷 Tags", command=lambda: self._act("tags")).pack(side="right", padx=(0, 6))
-        self.btn_fav = ttk.Button(bar, text="♡ Favori", width=11, command=lambda: self._act("fav"))
-        self.btn_fav.pack(side="right", padx=(0, 6))
+        Tooltip(self.btn_prev, "Photo précédente (←)")
+        self.btn_next = ttk.Button(bar, image=(icons.get("chev_right", 18, "text"), "disabled",
+                                               icons.get("chev_right", 18, "faint")),
+                                   style="Icon.TButton", command=self.next)
+        self.btn_next.pack(side="left", padx=(2, 0))
+        Tooltip(self.btn_next, "Photo suivante (→)")
+        self.pos_label = ttk.Label(bar, text="", style="Muted.TLabel")
+        self.pos_label.pack(side="left", padx=(SPACE_M, 0))
+        self.action_buttons: dict[str, ttk.Button] = {}
+        for action, label, icon, tip in reversed(self.ACTIONS):
+            b = ttk.Button(bar, text=label, image=icons.get(icon, 16, "secondary"), compound="left",
+                           style="Ghost.TButton",
+                           command=self.open_external if action == "open" else (lambda a=action: self._act(a)))
+            b.pack(side="right", padx=(2, 0))
+            Tooltip(b, tip)
+            self.action_buttons[action] = b
+        self.btn_fav = self.action_buttons["fav"]
+        self.btn_open = self.action_buttons["open"]
+        ttk.Separator(self.win, orient="horizontal").pack(side="top", fill="x")
 
-        # Informations
-        info = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 8))
+        # Informations (sous la photo)
+        info = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_M, SPACE_XL, SPACE_L))
         info.pack(side="bottom", fill="x")
-        self.info_title = ttk.Label(info, text="", style="Title.TLabel")
-        self.info_title.pack(anchor="w")
-        self.info_details = ttk.Label(info, text="", style="Panel.TLabel", justify="left")
-        self.info_details.pack(anchor="w", pady=(2, 0))
-        self.info_comment = ttk.Label(info, text="", style="Muted.TLabel", justify="left")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        head = ttk.Frame(info, style="Panel.TFrame")
+        head.pack(fill="x")
+        self.info_fav = ttk.Label(head, text=" Favori", image=icons.get("heart_fill", 14, "favorite"),
+                                  compound="left", style="FavChip.TLabel")
+        self.info_annot = ttk.Label(head, text="", image=icons.get("tag", 14, "accent_soft_text"),
+                                    compound="left", style="Chip.TLabel")
+        self.info_title = ttk.Label(head, text="", style="Title.TLabel")
+        self.info_title.pack(side="left", fill="x", expand=True, anchor="w")
+        self.info_details = ttk.Label(info, text="", style="Muted.TLabel", justify="left")
+        self.info_details.pack(anchor="w", pady=(SPACE_XS, 0))
+        self.info_comment = ttk.Label(info, text="", style="Small.TLabel", justify="left")
         self.info_comment.pack(anchor="w", pady=(2, 0))
-        self.info_annot = ttk.Label(info, text="", style="Favorite.TLabel", justify="left")
-        self.info_annot.pack(anchor="w", pady=(2, 0))
 
-        # Image
-        self.canvas = tk.Canvas(self.win, bg="#111214", highlightthickness=0)
+        # Image : fond neutre sombre, la photo reste l'élément central
+        self.canvas = tk.Canvas(self.win, bg=COLORS["viewer_bg"], highlightthickness=0)
+        self.canvas._viewer = True
         self.canvas.pack(side="top", fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_resize)
+        self.win.bind("<Configure>", self._on_win_resize, add="+")
 
         for key in ("<Left>", "<Prior>", "<BackSpace>"):
             self.win.bind(key, lambda e: self.prev())
@@ -2670,7 +3383,28 @@ class PhotoViewer:
                             ("<KeyPress-f>", "fav"), ("<KeyPress-t>", "tags"), ("<KeyPress-i>", "exif")):
             self.win.bind(seq, lambda e, a=action: self._act(a))
         self.canvas.bind("<Button-3>", self._on_menu)
+        self.canvas.tag_bind("navprev", "<Button-1>", lambda e: self.prev())
+        self.canvas.tag_bind("navnext", "<Button-1>", lambda e: self.next())
+        for t in ("navprev", "navnext"):
+            self.canvas.tag_bind(t, "<Enter>", lambda e: self.canvas.configure(cursor="hand2"))
+            self.canvas.tag_bind(t, "<Leave>", lambda e: self.canvas.configure(cursor=""))
         self._poll()
+
+    def _on_win_resize(self, event) -> None:
+        if event.widget is not self.win:
+            return
+        compact = event.width < 1080
+        if compact != self._compact:
+            self._compact = compact
+            for b in self.action_buttons.values():
+                b.configure(compound="image" if compact else "left",
+                            style="Icon.TButton" if compact else "Ghost.TButton")
+
+    def apply_theme(self) -> None:
+        self.win.configure(bg=COLORS["panel"])
+        self.canvas.configure(bg=COLORS["viewer_bg"])
+        if self.pil is not None:
+            self._render()
 
     # -- actions sur la photo affichée ---------------------------------------------
     def _act(self, action: str) -> None:
@@ -2688,16 +3422,21 @@ class PhotoViewer:
 
     def refresh_annotations(self) -> None:
         p = self.photo
+        self.info_fav.pack_forget()
+        self.info_annot.pack_forget()
         if p is None:
             self.info_annot.config(text="")
             return
         fav = self.app.is_favorite(p)
-        self.btn_fav.config(text="♥ Favori" if fav else "♡ Favori")
-        parts = ["♥ Dans vos favoris"] if fav else []
+        self.btn_fav.config(image=self.app.icons.get("heart_fill" if fav else "heart", 16,
+                                                     "favorite" if fav else "secondary"),
+                            text="Favori ✓" if fav else "Favori")
         tags = self.app.tags_of(p)
+        self.info_annot.config(text=" " + "  ·  ".join(tags) if tags else "")
         if tags:
-            parts.append("🏷 Tags : " + ", ".join(tags))
-        self.info_annot.config(text="     ".join(parts))
+            self.info_annot.pack(side="right", padx=(SPACE_S, 0))
+        if fav:
+            self.info_fav.pack(side="right", padx=(SPACE_S, 0))
 
     # -- navigation --------------------------------------------------------
     def show(self, ids: list[int], index: int) -> None:
@@ -2734,6 +3473,7 @@ class PhotoViewer:
         self.tkimg = None
         self.canvas.delete("all")
         self.win.withdraw()
+        self.app.viewer_closed()
 
     # -- affichage -----------------------------------------------------------
     def _update_info(self) -> None:
@@ -2752,7 +3492,7 @@ class PhotoViewer:
             if p.date is not None:
                 details.append(f"Modifiée le : {format_date(p.date)}")
             details.append(f"Taille : {format_size(p.size)}")
-            self._details = "     ".join(details)
+            self._details = "   ·   ".join(details)
             self.info_details.config(text=self._details)
             self.info_comment.config(text=f"Chemin : {safe_text(p.image_path)}")
             return
@@ -2765,16 +3505,28 @@ class PhotoViewer:
             details.append(f"Événement : {p.event_name}")
         if p.is_video:
             details.append("Type : vidéo")
-        self._details = "     ".join(details)
+        self._details = "   ·   ".join(details)
         self.info_details.config(text=self._details)
         comment = p.comment if p.comment and p.comment != p.caption else ""
         self.info_comment.config(text=f"Commentaire : {comment}" if comment else "")
 
-    def _message(self, text: str, color: str = COLORS["muted"]) -> None:
+    def _message(self, text: str, color: Optional[str] = None, error: bool = False) -> None:
         self.canvas.delete("all")
         w, h = max(self.canvas.winfo_width(), 100), max(self.canvas.winfo_height(), 100)
-        self.canvas.create_text(w // 2, h // 2, text=text, fill=color, font=self.app.font_big,
-                                justify="center", width=w - 40)
+        icon = self.app.icons.get("image_off" if error else "photos", 48, "#6E7887")
+        self.canvas.create_image(w // 2, h // 2 - 44, image=icon)
+        self.canvas.create_text(w // 2, h // 2 + 14, text=text, fill=color or COLORS["viewer_text"],
+                                font=self.app.font_big, justify="center", width=w - 80, anchor="n")
+        self._draw_nav(w, h)
+
+    def _draw_nav(self, cw: int, ch: int) -> None:
+        """Boutons « précédente / suivante » en surimpression, de part et d'autre de la photo."""
+        if cw < 260:
+            return
+        for tag, x, icon, ok in (("navprev", 36, "chev_left", self.index > 0),
+                                 ("navnext", cw - 36, "chev_right", self.index < len(self.ids) - 1)):
+            if ok:
+                self.canvas.create_image(x, ch // 2, image=self.app.overlay_button(icon), tags=(tag,))
 
     def _load_current(self) -> None:
         p = self.photo
@@ -2827,9 +3579,9 @@ class PhotoViewer:
                     continue
                 if dims:
                     self.info_details.config(
-                        text=f"{self._details}     Dimensions : {dims[0]} × {dims[1]} px")
+                        text=f"{self._details}   ·   {dims[0]} × {dims[1]} px")
                 if img is None:
-                    self._message(err, COLORS["missing"])
+                    self._message(err, COLORS["missing"], error=True)
                 else:
                     self.pil = img
                     self.note = note
@@ -2849,8 +3601,9 @@ class PhotoViewer:
         if self.pil is None:
             return
         cw, ch = max(self.canvas.winfo_width(), 50), max(self.canvas.winfo_height(), 50)
+        pad = SPACE_XL if min(cw, ch) > 300 else SPACE_S
         iw, ih = self.pil.size
-        scale = min(cw / iw, ch / ih, 1.0)
+        scale = min((cw - 2 * pad) / iw, (ch - 2 * pad) / ih, 1.0)
         size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
         img = self.pil if size == self.pil.size else self.pil.resize(size, Image.BILINEAR)
         self.tkimg = ImageTk.PhotoImage(img)
@@ -2858,8 +3611,16 @@ class PhotoViewer:
         self.canvas.create_image(cw // 2, ch // 2, image=self.tkimg, anchor="center")
         note = getattr(self, "note", "")
         if note:
-            self.canvas.create_text(10, ch - 10, text=note, fill=COLORS["video"] if self.photo and self.photo.is_video else COLORS["muted"],
-                                    anchor="sw", font=self.app.font_small)
+            video = bool(self.photo and self.photo.is_video)
+            font = self.app.font_small
+            tw = font.measure(note) + (40 if video else 24)
+            self.canvas.create_image(pad, ch - pad, image=self.app.pill_image(tw, 26), anchor="sw")
+            x = pad + 12
+            if video:
+                self.canvas.create_image(x, ch - pad - 13, image=self.app.icons.get("play", 12, "white"), anchor="w")
+                x += 16
+            self.canvas.create_text(x, ch - pad - 13, text=note, fill="#FFFFFF", anchor="w", font=font)
+        self._draw_nav(cw, ch)
 
     def open_external(self) -> None:
         p = self.photo
@@ -2882,32 +3643,40 @@ class LibraryDialog:
     def __init__(self, app: "MainWindow"):
         self.app = app
         self.win = tk.Toplevel(app.root)
-        self.win.title("Ouvrir une bibliothèque")
+        self.win.title("Ouvrir une bibliothèque — iphotor")
         self.win.configure(bg=COLORS["panel"])
         self.win.transient(app.root)
-        self.win.geometry("860x460")
-        self.win.minsize(600, 320)
+        self.win.geometry("900x500")
+        self.win.minsize(640, 360)
         self.results: "queue.Queue[list]" = queue.Queue()
         self.cancel = threading.Event()
         self.paths: dict[str, tuple[str, str]] = {}   # iid -> (chemin, type)
 
-        head = ttk.Frame(self.win, padding=(12, 10, 12, 4))
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_M))
         head.pack(side="top", fill="x")
-        ttk.Label(head, text="Choisissez la bibliothèque à explorer", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(head, text=f"Bibliothèque actuelle : {app.library.root}", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(head, image=app.icons.get("library", 28, "accent"), style="Panel.TLabel").pack(
+            side="left", padx=(0, SPACE_M), anchor="n")
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text="Choisissez la bibliothèque à explorer", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(txt, text=f"Bibliothèque actuelle : {app.library.root}", style="Muted.TLabel").pack(anchor="w")
 
-        btns = ttk.Frame(self.win, padding=(12, 6, 12, 12))
-        btns.pack(side="bottom", fill="x")
-        self.scan_label = ttk.Label(btns, text="", style="Muted.TLabel")
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        btns = foot
+        self.scan_label = ttk.Label(btns, text="", style="Footer.TLabel")
         self.scan_label.pack(side="left")
-        ttk.Button(btns, text="Annuler", command=self.close).pack(side="right")
-        self.btn_open = ttk.Button(btns, text="Ouvrir", command=self.open_selected)
-        self.btn_open.pack(side="right", padx=(0, 6))
-        ttk.Button(btns, text="Parcourir…", command=self.browse).pack(side="right", padx=(0, 6))
-        self.btn_scan = ttk.Button(btns, text="Rechercher sur les disques", command=self.scan)
-        self.btn_scan.pack(side="right", padx=(0, 6))
+        self.btn_open = ttk.Button(btns, text="Ouvrir", style="Accent.TButton", command=self.open_selected)
+        self.btn_open.pack(side="right")
+        ttk.Button(btns, text="Annuler", command=self.close).pack(side="right", padx=(0, SPACE_S))
+        ttk.Button(btns, text="Parcourir…", image=app.icons.get("folder_open", 16), compound="left",
+                   command=self.browse).pack(side="right", padx=(0, SPACE_S))
+        self.btn_scan = ttk.Button(btns, text="Rechercher sur les disques", image=app.icons.get("search", 16),
+                                   compound="left", command=self.scan)
+        self.btn_scan.pack(side="right", padx=(0, SPACE_S))
 
-        body = ttk.Frame(self.win, padding=(12, 4))
+        body = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, 0, SPACE_XL, SPACE_M))
         body.pack(side="top", fill="both", expand=True)
         self.tree = ttk.Treeview(body, columns=("path", "state"), show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="Bibliothèque", anchor="w")
@@ -2920,16 +3689,18 @@ class LibraryDialog:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tree.tag_configure("section", font=app.font_bold, foreground=COLORS["accent"])
-        self.tree.tag_configure("current", foreground="#7fd17f")
-        self.tree.tag_configure("disabled", foreground=COLORS["muted"])
+        self.tree.tag_configure("section", font=app.font_bold, foreground=COLORS["text"])
+        self.tree.tag_configure("current", foreground=COLORS["success"])
+        self.tree.tag_configure("disabled", foreground=COLORS["faint"])
         self.tree.bind("<Double-1>", lambda e: self.open_selected())
         self.tree.bind("<Return>", lambda e: self.open_selected())
         self.win.bind("<Escape>", lambda e: self.close())
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.tree.insert("", "end", iid="recent", text="Récentes", open=True, tags=("section",))
-        self.tree.insert("", "end", iid="found", text="Détectées sur les disques", open=True, tags=("section",))
+        self.tree.insert("", "end", iid="recent", text=" Récentes", open=True, tags=("section",),
+                         image=app.icons.get("refresh", 16, "accent"))
+        self.tree.insert("", "end", iid="found", text=" Détectées sur les disques", open=True, tags=("section",),
+                         image=app.icons.get("search", 16, "accent"))
         for p in app.settings.recent:
             self._add("recent", p, library_kind(p) or LIB_IPHOTO)
         if not app.settings.recent:
@@ -2953,7 +3724,7 @@ class LibraryDialog:
         elif os.path.abspath(path) == self.app.library.root:
             tags = ("current",)
             name += "  (actuelle)"
-        self.tree.insert(parent, "end", iid=iid, text=name,
+        self.tree.insert(parent, "end", iid=iid, text=" " + name, image=self.app.icons.get("library", 16),
                          values=(os.path.dirname(path), library_status(path)), tags=tags)
         self.paths[iid] = (path, kind)
 
@@ -3040,17 +3811,37 @@ class LibraryDialog:
 
 
 class _Dialog:
-    """Base des petites fenêtres modales."""
+    """Base des petites fenêtres modales : en-tête (icône, titre, sous-titre), corps, pied à boutons."""
 
-    def __init__(self, app: "MainWindow", parent, title: str):
+    def __init__(self, app: "MainWindow", parent, title: str, heading: str = "", subtitle: str = "",
+                 icon: str = ""):
         self.app = app
         self.win = tk.Toplevel(parent)
         self.win.title(title)
         self.win.configure(bg=COLORS["panel"])
         self.win.transient(parent)
         self.win.resizable(True, False)
-        self.body = ttk.Frame(self.win, style="Panel.TFrame", padding=16)
+        if heading:
+            head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, 0))
+            head.pack(side="top", fill="x")
+            if icon:
+                ttk.Label(head, image=app.icons.get(icon, 28, "accent"), style="Panel.TLabel").pack(
+                    side="left", padx=(0, SPACE_M), anchor="n")
+            txt = ttk.Frame(head, style="Panel.TFrame")
+            txt.pack(side="left", fill="x", expand=True)
+            ttk.Label(txt, text=heading, style="Title.TLabel").pack(anchor="w")
+            if subtitle:
+                ttk.Label(txt, text=subtitle, style="Muted.TLabel").pack(anchor="w")
+        self.footer = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        self.footer.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        self.body = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_L))
         self.body.pack(fill="both", expand=True)
+
+    def buttons(self, ok_text: str, ok_cmd: Callable, cancel_text: str = "Annuler") -> None:
+        """Bouton principal (bleu) à droite, bouton secondaire à sa gauche."""
+        ttk.Button(self.footer, text=ok_text, style="Accent.TButton", command=ok_cmd).pack(side="right")
+        ttk.Button(self.footer, text=cancel_text, command=self.win.destroy).pack(side="right", padx=(0, SPACE_S))
 
     def _grab(self) -> None:
         try:
@@ -3065,31 +3856,28 @@ class TagDialog(_Dialog):
     """Choix des tags d'une photo : tags existants (cases) et nouveaux tags."""
 
     def __init__(self, app: "MainWindow", parent, photo: Photo, current: list[str], known: list[str]):
-        super().__init__(app, parent, "Tags — iphotor")
+        super().__init__(app, parent, "Tags — iphotor", "Tags de la photo",
+                         safe_text(photo.filename or photo.label), icon="tag")
         self.result: Optional[list[str]] = None
         b = self.body
-        ttk.Label(b, text="Tags de la photo", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(b, text=safe_text(photo.filename or photo.label), style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
         self.vars: dict[str, tk.BooleanVar] = {}
         names = sorted(set(known) | set(current), key=normalize_text)
         if names:
-            ttk.Label(b, text="Tags existants :", style="Panel.TLabel").pack(anchor="w")
+            ttk.Label(b, text="TAGS EXISTANTS", style="Section.TLabel").pack(anchor="w")
             box = ttk.Frame(b, style="Panel.TFrame")
-            box.pack(anchor="w", fill="x", pady=(2, 10))
+            box.pack(anchor="w", fill="x", pady=(SPACE_XS, SPACE_L))
             cols = 3
             for i, name in enumerate(names):
                 var = tk.BooleanVar(value=name in current)
                 self.vars[name] = var
                 ttk.Checkbutton(box, text=name, variable=var).grid(row=i // cols, column=i % cols,
                                                                    sticky="w", padx=(0, 18), pady=1)
-        ttk.Label(b, text="Nouveaux tags (séparés par des virgules) :", style="Panel.TLabel").pack(anchor="w")
+        ttk.Label(b, text="NOUVEAUX TAGS", style="Section.TLabel").pack(anchor="w")
         self.new_var = tk.StringVar()
         entry = ttk.Entry(b, textvariable=self.new_var, width=48)
-        entry.pack(anchor="w", fill="x", pady=(2, 12))
-        btns = ttk.Frame(b, style="Panel.TFrame")
-        btns.pack(fill="x")
-        ttk.Button(btns, text="Enregistrer", command=self.ok).pack(side="right")
-        ttk.Button(btns, text="Annuler", command=self.win.destroy).pack(side="right", padx=(0, 6))
+        entry.pack(anchor="w", fill="x", pady=(SPACE_XS, 2))
+        ttk.Label(b, text="Séparez plusieurs tags par des virgules.", style="Small.TLabel").pack(anchor="w")
+        self.buttons("Enregistrer", self.ok)
         self.win.bind("<Return>", lambda e: self.ok())
         self.win.bind("<Escape>", lambda e: self.win.destroy())
         self._grab()
@@ -3113,47 +3901,56 @@ class ExifDialog:
         self.win = tk.Toplevel(parent)
         self.win.title(f"Informations — {photo.filename or photo.label}")
         self.win.configure(bg=COLORS["panel"])
-        self.win.geometry("640x620")
-        self.win.minsize(420, 300)
-        top = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 10))
+        self.win.geometry("680x640")
+        self.win.minsize(440, 320)
+        top = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_M))
         top.pack(side="top", fill="x")
-        ttk.Label(top, text=safe_text(photo.filename or photo.label), style="Title.TLabel").pack(anchor="w")
+        ttk.Label(top, image=app.icons.get("info", 28, "accent"), style="Panel.TLabel").pack(
+            side="left", padx=(0, SPACE_M), anchor="n")
+        txt = ttk.Frame(top, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text=safe_text(photo.filename or photo.label), style="Title.TLabel").pack(anchor="w")
         try:
             size = format_size(os.path.getsize(path))
         except OSError:
             size = "?"
-        ttk.Label(top, text=f"{safe_text(path)}   ·   {size}", style="Muted.TLabel",
-                  wraplength=600, justify="left").pack(anchor="w")
+        ttk.Label(txt, text=f"{safe_text(path)}   ·   {size}", style="Muted.TLabel",
+                  wraplength=560, justify="left").pack(anchor="w")
 
-        btns = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 8))
+        btns = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
         btns.pack(side="bottom", fill="x")
-        ttk.Button(btns, text="Fermer", command=self.win.destroy).pack(side="right")
-        ttk.Button(btns, text="Copier le texte", command=self.copy_text).pack(side="right", padx=(0, 6))
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        ttk.Button(btns, text="Fermer", style="Accent.TButton", command=self.win.destroy).pack(side="right")
+        ttk.Button(btns, text="Copier le texte", image=app.icons.get("copy", 16), compound="left",
+                   command=self.copy_text).pack(side="right", padx=(0, SPACE_S))
         if data.get("gps"):
-            ttk.Button(btns, text="Voir sur une carte", command=self.open_map).pack(side="left")
+            ttk.Button(btns, text="Voir sur une carte", image=app.icons.get("external", 16), compound="left",
+                       command=self.open_map).pack(side="left")
 
-        frame = ttk.Frame(self.win, style="Panel.TFrame", padding=(12, 0))
+        frame = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_L, 0, SPACE_L, SPACE_S))
         frame.pack(side="top", fill="both", expand=True)
-        self.tree = ttk.Treeview(frame, columns=("v",), show="tree", selectmode="browse")
+        self.tree = ttk.Treeview(frame, columns=("v",), show="tree", selectmode="browse", style="Item.Treeview")
         self.tree.column("#0", width=230, stretch=False)
         self.tree.column("v", width=380, stretch=True)
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tree.tag_configure("section", font=app.font_bold, foreground=COLORS["accent"])
+        self.tree.tag_configure("section", font=app.font_bold, foreground=COLORS["text"])
+        self.tree.tag_configure("odd", background=COLORS["footer"])
         self.tree.tag_configure("error", foreground=COLORS["missing"])
 
         if data.get("error"):
-            self.tree.insert("", "end", text="⚠ " + data["error"], tags=("error",))
+            self.tree.insert("", "end", text=" " + data["error"], tags=("error",),
+                             image=app.icons.get("warning", 16, "missing"))
         if data.get("summary"):
             sec = self.tree.insert("", "end", text="Résumé", tags=("section",), open=True)
-            for label, value in data["summary"]:
-                self.tree.insert(sec, "end", text=label, values=(value,))
+            for i, (label, value) in enumerate(data["summary"]):
+                self.tree.insert(sec, "end", text=label, values=(value,), tags=("odd",) if i % 2 else ())
         for group, items in data.get("groups", []):
             sec = self.tree.insert("", "end", text=f"{group} ({len(items)})", tags=("section",), open=False)
-            for name, value in items:
-                self.tree.insert(sec, "end", text=name, values=(value,))
+            for i, (name, value) in enumerate(items):
+                self.tree.insert(sec, "end", text=name, values=(value,), tags=("odd",) if i % 2 else ())
         self.win.bind("<Escape>", lambda e: self.win.destroy())
         self.win.focus_force()
 
@@ -3186,20 +3983,20 @@ class CopyDialog(_Dialog):
 
     def __init__(self, app: "MainWindow", parent, what: str, summary: str, subdir_name: str,
                  is_library: bool):
-        super().__init__(app, parent, "Copier vers un dossier — iphotor")
+        super().__init__(app, parent, "Copier vers un dossier — iphotor", f"Copier {what}", summary,
+                         icon="folder_arrow")
         self.result: Optional[dict] = None
         st = app.settings
         b = self.body
-        ttk.Label(b, text=f"Copier {what}", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(b, text=summary, style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
-        ttk.Label(b, text="Dossier de destination :", style="Panel.TLabel").pack(anchor="w")
+        ttk.Label(b, text="DOSSIER DE DESTINATION", style="Section.TLabel").pack(anchor="w")
         row = ttk.Frame(b, style="Panel.TFrame")
-        row.pack(fill="x", pady=(2, 10))
+        row.pack(fill="x", pady=(SPACE_XS, SPACE_M))
         default = st.copy_dest if st.copy_dest and os.path.isdir(st.copy_dest) else ""
         self.dest_var = tk.StringVar(value=default)
         self.entry = ttk.Entry(row, textvariable=self.dest_var, width=56)
         self.entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Parcourir…", command=self.browse).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="Parcourir…", image=app.icons.get("folder_open", 16), compound="left",
+                   command=self.browse).pack(side="left", padx=(SPACE_S, 0))
         self.sub_var = tk.BooleanVar(value=bool(subdir_name))
         self.subdir_name = subdir_name
         if subdir_name:
@@ -3207,7 +4004,7 @@ class CopyDialog(_Dialog):
                             variable=self.sub_var).pack(anchor="w")
         self.orig_var = tk.BooleanVar(value=st.copy_original)
         if is_library:
-            ttk.Label(b, text="Fichier copié :", style="Panel.TLabel").pack(anchor="w", pady=(8, 0))
+            ttk.Label(b, text="FICHIER COPIÉ", style="Section.TLabel").pack(anchor="w", pady=(SPACE_M, 2))
             ttk.Radiobutton(b, text="Version affichée (la version retouchée si elle existe)",
                             variable=self.orig_var, value=False).pack(anchor="w")
             ttk.Radiobutton(b, text="Fichier original (tel que sorti de l'appareil, RAW compris)",
@@ -3215,13 +4012,14 @@ class CopyDialog(_Dialog):
         self.open_var = tk.BooleanVar(value=st.copy_open)
         ttk.Checkbutton(b, text="Ouvrir le dossier de destination à la fin",
                         variable=self.open_var).pack(anchor="w", pady=(8, 0))
-        ttk.Label(b, text="Les fichiers existants ne sont jamais remplacés : un numéro est ajouté au nom "
-                          "si besoin.\nLes fichiers d'origine ne sont ni modifiés ni déplacés.",
-                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(12, 12))
-        btns = ttk.Frame(b, style="Panel.TFrame")
-        btns.pack(fill="x")
-        ttk.Button(btns, text="Copier", command=self.ok).pack(side="right")
-        ttk.Button(btns, text="Annuler", command=self.win.destroy).pack(side="right", padx=(0, 6))
+        note = ttk.Frame(b, style="Panel.TFrame")
+        note.pack(anchor="w", fill="x", pady=(SPACE_M, 0))
+        ttk.Label(note, image=app.icons.get("lock", 14, "muted"), style="Panel.TLabel").pack(side="left", anchor="n",
+                                                                                          pady=(2, 0))
+        ttk.Label(note, text="Les fichiers existants ne sont jamais remplacés : un numéro est ajouté au nom "
+                             "si besoin.\nLes fichiers d'origine ne sont ni modifiés ni déplacés.",
+                  style="Small.TLabel", justify="left").pack(side="left", padx=(SPACE_S, 0))
+        self.buttons("Copier", self.ok)
         self.win.bind("<Return>", lambda e: self.ok())
         self.win.bind("<Escape>", lambda e: self.win.destroy())
         self._grab()
@@ -3268,16 +4066,25 @@ class CopyProgress:
         self.win.configure(bg=COLORS["panel"])
         self.win.resizable(False, False)
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
-        b = ttk.Frame(self.win, style="Panel.TFrame", padding=16)
+        head = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, 0))
+        head.pack(fill="x")
+        ttk.Label(head, image=app.icons.get("copy", 28, "accent"), style="Panel.TLabel").pack(
+            side="left", padx=(0, SPACE_M), anchor="n")
+        txt = ttk.Frame(head, style="Panel.TFrame")
+        txt.pack(side="left", fill="x", expand=True)
+        ttk.Label(txt, text=title, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(txt, text=f"vers {safe_text(task.dest)}", style="Muted.TLabel").pack(anchor="w")
+        foot = ttk.Frame(self.win, style="Footer.TFrame", padding=(SPACE_XL, SPACE_M))
+        foot.pack(side="bottom", fill="x")
+        ttk.Separator(self.win, orient="horizontal").pack(side="bottom", fill="x")
+        b = ttk.Frame(self.win, style="Panel.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_XL, SPACE_L))
         b.pack(fill="both", expand=True)
-        ttk.Label(b, text=title, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(b, text=f"vers {safe_text(task.dest)}", style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
-        self.bar = ttk.Progressbar(b, mode="determinate", length=420, maximum=max(1, task.total))
+        self.bar = ttk.Progressbar(b, mode="determinate", length=440, maximum=max(1, task.total))
         self.bar.pack(fill="x")
-        self.label = ttk.Label(b, text="Préparation…", style="Panel.TLabel")
-        self.label.pack(anchor="w", pady=(6, 10))
-        self.btn = ttk.Button(b, text="Annuler", command=self.cancel)
-        self.btn.pack(anchor="e")
+        self.label = ttk.Label(b, text="Préparation…", style="Muted.TLabel")
+        self.label.pack(anchor="w", pady=(SPACE_S, 0))
+        self.btn = ttk.Button(foot, text="Annuler", command=self.cancel)
+        self.btn.pack(side="right")
         threading.Thread(target=task.run, daemon=True, name="copie").start()
         self.win.after(100, self._poll)
 
@@ -3361,7 +4168,8 @@ class MainWindow:
         self._building = False
         self._build_queue: "queue.Queue[tuple]" = queue.Queue()
         self.current_album_id: Optional[int] = None
-        self._last_grid_msg: tuple[str, str] = ("", COLORS["muted"])
+        self._last_grid_msg: tuple[str, str] = ("", "")
+        self.current_index: Optional[int] = None   # photo affichée dans la visionneuse (index absolu)
 
         # Mode « Explorer un dossier »
         self.mode = MODE_LIBRARY
@@ -3386,65 +4194,186 @@ class MainWindow:
     # -- style ---------------------------------------------------------------
     def _setup_style(self) -> None:
         root = self.root
+        COLORS.clear()
+        COLORS.update(PALETTES.get(self.settings.theme, PALETTES["light"]))
         root.configure(bg=COLORS["bg"])
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{min(1500, int(sw * 0.9))}x{min(950, int(sh * 0.88))}")
         root.minsize(900, 560)
 
-        base = tkfont.nametofont("TkDefaultFont")
-        base.configure(size=10)
-        self.font = base
-        self.font_small = tkfont.Font(family=base.cget("family"), size=9)
-        self.font_bold = tkfont.Font(family=base.cget("family"), size=10, weight="bold")
-        self.font_title = tkfont.Font(family=base.cget("family"), size=13, weight="bold")
-        self.font_big = tkfont.Font(family=base.cget("family"), size=12)
-
-        st = ttk.Style(root)
+        self.fonts = setup_fonts(root)
+        f = self.fonts
+        self.font = f["base"]
+        self.font_small = f["small"]
+        self.font_bold = f["bold"]
+        self.font_title = f["title"]
+        self.font_big = f["big"]
+        self.font_badge = f["badge"]
+        self.icons = Icons(root)
+        self.theme = Theme(root, f)
+        self.theme.apply()
+        self._custom_images: dict[str, tuple[object, Callable]] = {}
         try:
-            st.theme_use("clam")
+            root.iconphoto(True, ImageTk.PhotoImage(draw_logo(64, PALETTES["light"]["accent_fill"]), master=root))
         except tk.TclError:
             pass
-        c = COLORS
-        st.configure(".", background=c["panel"], foreground=c["text"], fieldbackground=c["tile"],
-                     bordercolor=c["bg"], lightcolor=c["panel"], darkcolor=c["panel"])
-        st.configure("TFrame", background=c["panel"])
-        st.configure("Panel.TFrame", background=c["panel"])
-        st.configure("Bg.TFrame", background=c["bg"])
-        st.configure("TLabel", background=c["panel"], foreground=c["text"])
-        st.configure("Panel.TLabel", background=c["panel"], foreground=c["text"])
-        st.configure("Muted.TLabel", background=c["panel"], foreground=c["muted"])
-        st.configure("Favorite.TLabel", background=c["panel"], foreground=c["favorite"])
-        st.configure("Title.TLabel", background=c["panel"], foreground=c["text"], font=self.font_title)
-        st.configure("Status.TLabel", background=c["bg"], foreground=c["muted"], font=self.font_small, padding=(8, 3))
-        st.configure("TButton", background=c["tile"], foreground=c["text"], padding=(10, 4), borderwidth=0)
-        st.map("TButton", background=[("disabled", c["panel"]), ("active", c["tile_hover"])],
-               foreground=[("disabled", "#666")])
-        st.configure("TEntry", fieldbackground=c["tile"], foreground=c["text"], insertcolor=c["text"], padding=4)
-        st.configure("TCombobox", fieldbackground=c["tile"], foreground=c["text"], background=c["tile"],
-                     arrowcolor=c["text"], padding=3)
-        st.map("TCombobox", fieldbackground=[("readonly", c["tile"])], foreground=[("readonly", c["text"])])
-        root.option_add("*TCombobox*Listbox.background", c["tile"])
-        root.option_add("*TCombobox*Listbox.foreground", c["text"])
-        st.configure("Treeview", background=c["panel"], fieldbackground=c["panel"], foreground=c["text"],
-                     rowheight=24, borderwidth=0)
-        st.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", "white")])
-        st.configure("Treeview.Heading", background=c["bg"], foreground=c["muted"], borderwidth=0)
-        st.configure("Vertical.TScrollbar", background=c["tile"], troughcolor=c["panel"], arrowcolor=c["muted"],
-                     borderwidth=0)
-        st.configure("Horizontal.TProgressbar", background=c["accent"], troughcolor=c["tile"])
-        st.configure("Mode.Toolbutton", background=c["tile"], foreground=c["text"], padding=(12, 4), borderwidth=0)
-        st.map("Mode.Toolbutton", background=[("selected", c["accent"]), ("active", c["tile_hover"])],
-               foreground=[("selected", "white")])
-        st.configure("TCheckbutton", background=c["panel"], foreground=c["text"])
-        st.map("TCheckbutton", background=[("active", c["panel"])])
-        st.configure("Toolbar.TFrame", background=c["bg"])
-        st.configure("Toolbar.TLabel", background=c["bg"], foreground=c["muted"])
-        st.configure("Toolbar.TCheckbutton", background=c["bg"], foreground=c["text"])
-        st.map("Toolbar.TCheckbutton", background=[("active", c["bg"])])
+
+    # -- images composées (vignettes, badges, surimpressions) ----------------------------
+    def _custom(self, key: str, build: Callable):
+        """Image mise en cache ; build() est rappelée lors d'un changement de thème."""
+        entry = self._custom_images.get(key)
+        if entry is None:
+            entry = (ImageTk.PhotoImage(build(), master=self.root), build)
+            self._custom_images[key] = entry
+        return entry[0]
+
+    def card_image(self, state: str):
+        """Fond d'une vignette (carte arrondie avec ombre douce) : normal, hover, current."""
+        def build():
+            c = COLORS
+            dark = self.settings.theme == "dark"
+            border = {"normal": c["card_border"], "hover": c["card_hover_border"], "current": c["accent"]}[state]
+            shadow = None if dark else (c["shadow"], 26 if state == "normal" else 46, 3 if state == "normal" else 5)
+            return rounded_image(TILE_W, TILE_H, 10, c["card"], border, 2 if state == "current" else 1,
+                                 bg=c["bg"], shadow=shadow, inset=5)
+        return self._custom(f"card:{state}", build)
+
+    def well_image(self):
+        return self._custom("well", lambda: rounded_image(THUMB_SIZE, THUMB_SIZE, 7, COLORS["well"], None,
+                                                          bg=COLORS["card"]))
+
+    def pill_image(self, w: int, h: int = 20, color: str = "#10141B", alpha: int = 170):
+        w = max(h, int(w))
+        return self._custom(f"pill:{w}:{h}:{color}:{alpha}",
+                            lambda: rounded_image(w, h, h / 2, color, None, fill_alpha=alpha))
+
+    def badge_image(self, icon: str, role: str):
+        """Pastille ronde blanche avec icône (favori sur les vignettes)."""
+        def build():
+            img = rounded_image(26, 26, 13, "#FFFFFF", None, fill_alpha=235,
+                                shadow=("#000000", 60, 1.5), inset=2)
+            ic = draw_icon(icon, 14, COLORS[role])
+            img.alpha_composite(ic, (6, 6))
+            return img
+        return self._custom(f"badge:{icon}:{role}", build)
+
+    def overlay_button(self, icon: str):
+        def build():
+            img = rounded_image(44, 44, 22, "#0B0E13", None, fill_alpha=120)
+            img.alpha_composite(draw_icon(icon, 22, "#FFFFFF"), (11, 11))
+            return img
+        return self._custom(f"overlay:{icon}", build)
+
+    _round_masks: dict = {}
+
+    @classmethod
+    def _round_mask(cls, size: tuple[int, int], r: int = 6):
+        mask = cls._round_masks.get(size)
+        if mask is None:
+            ss = 3
+            big = Image.new("L", (size[0] * ss, size[1] * ss), 0)
+            ImageDraw.Draw(big).rounded_rectangle([0, 0, size[0] * ss - 1, size[1] * ss - 1], r * ss, fill=255)
+            mask = big.resize(size, Image.LANCZOS)
+            if len(cls._round_masks) > 400:
+                cls._round_masks.clear()
+            cls._round_masks[size] = mask
+        return mask
+
+    def rounded_thumbnail(self, img):
+        """Coins arrondis anticrénelés pour une vignette (copie, l'image chargée n'est pas modifiée)."""
+        try:
+            out = img.convert("RGBA")
+            out.putalpha(self._round_mask(out.size))
+            return out
+        except Exception:
+            return img
+
+    # -- thème clair / sombre -------------------------------------------------------------
+    def set_theme(self, name: str) -> None:
+        if name not in PALETTES:
+            return
+        old = dict(COLORS)
+        self.settings.theme = name
+        self.settings.save()
+        if self.theme_var.get() != (name == "dark"):
+            self.theme_var.set(name == "dark")
+        COLORS.clear()
+        COLORS.update(PALETTES[name])
+        remap = {old[k]: COLORS[k] for k in old}
+        self.theme.apply()
+        self.icons.refresh()
+        for img, build in self._custom_images.values():
+            img.paste(build())
+        self._apply_tk_colors(self.root)
+        self.btn_theme.configure(image=self.icons.get("sun" if name == "dark" else "moon", 18, "secondary"))
+        self._last_grid_msg = (self._last_grid_msg[0], remap.get(self._last_grid_msg[1], self._last_grid_msg[1]))
+        for st in self._mode_states.values():
+            if "grid_msg" in st:
+                st["grid_msg"] = (st["grid_msg"][0], remap.get(st["grid_msg"][1], st["grid_msg"][1]))
+        self._configure_tree_tags()
+        if self.page_photos:
+            self._layout()
+        else:
+            self._show_grid_message(*self._last_grid_msg)
+        if self.viewer is not None and self.viewer.win.winfo_exists():
+            self.viewer.apply_theme()
+        self._set_status("Thème sombre activé." if name == "dark" else "Thème clair activé.")
+
+    def toggle_theme(self) -> None:
+        self.set_theme("light" if self.settings.theme == "dark" else "dark")
+
+    def _apply_tk_colors(self, widget) -> None:
+        """Recolore les widgets Tk classiques (les widgets ttk suivent leur style)."""
+        for child in widget.winfo_children():
+            self._apply_tk_colors(child)
+        w = widget
+        try:
+            if isinstance(w, tk.Canvas):
+                w.configure(bg=COLORS["viewer_bg"] if getattr(w, "_viewer", False) else COLORS["bg"])
+            elif isinstance(w, tk.PanedWindow):
+                w.configure(bg=COLORS["bg"])
+            elif isinstance(w, tk.Menu):
+                w.configure(bg=COLORS["panel"], fg=COLORS["text"], activebackground=COLORS["accent_soft"],
+                            activeforeground=COLORS["accent_soft_text"], disabledforeground=COLORS["faint"],
+                            selectcolor=COLORS["accent"])
+            elif isinstance(w, tk.Tk):
+                w.configure(bg=COLORS["bg"])
+            elif isinstance(w, tk.Toplevel):
+                w.configure(bg=COLORS["panel"])
+            elif isinstance(w, tk.Frame):
+                w.configure(bg=COLORS["separator"])
+        except tk.TclError:
+            pass
+
+    def _configure_tree_tags(self) -> None:
+        for t in (self.tree, self.ftree):
+            t.tag_configure("section", font=self.font_bold, foreground=COLORS["text"])
+            t.tag_configure("empty", foreground=COLORS["faint"])
+            t.tag_configure("folder", foreground=COLORS["text"])
+            t.tag_configure("error", foreground=COLORS["missing"])
+            t.tag_configure("hover", background=COLORS["row_hover"])
+
+    def _tree_hover(self, tree, event) -> None:
+        iid = tree.identify_row(event.y)
+        old = getattr(tree, "_hover_iid", "")
+        if iid == old:
+            return
+        if old and tree.exists(old):
+            tree.item(old, tags=tuple(t for t in tree.item(old, "tags") if t != "hover"))
+        tree._hover_iid = iid
+        if iid and iid not in tree.selection():
+            tree.item(iid, tags=tuple(tree.item(iid, "tags")) + ("hover",))
+
+    def _tree_unhover(self, tree) -> None:
+        old = getattr(tree, "_hover_iid", "")
+        if old and tree.exists(old):
+            tree.item(old, tags=tuple(t for t in tree.item(old, "tags") if t != "hover"))
+        tree._hover_iid = ""
 
     # -- construction de l'interface ---------------------------------------
     def _build_ui(self) -> None:
         root = self.root
+        ic = self.icons
         menubar = tk.Menu(root)
         m_file = tk.Menu(menubar, tearoff=False)
         m_file.add_command(label="Ouvrir une bibliothèque…", command=self.open_library_dialog,
@@ -3466,6 +4395,11 @@ class MainWindow:
         m_file.add_separator()
         m_file.add_command(label="Quitter", command=self.quit, accelerator="Ctrl+Q")
         menubar.add_cascade(label="Fichier", menu=m_file)
+        m_view = tk.Menu(menubar, tearoff=False)
+        self.theme_var = tk.BooleanVar(value=self.settings.theme == "dark")
+        m_view.add_checkbutton(label="Thème sombre", variable=self.theme_var,
+                               command=lambda: self.set_theme("dark" if self.theme_var.get() else "light"))
+        menubar.add_cascade(label="Affichage", menu=m_view)
         m_help = tk.Menu(menubar, tearoff=False)
         m_help.add_command(label="Raccourcis clavier", command=self.show_shortcuts)
         m_help.add_command(label="À propos", command=self.show_about)
@@ -3483,113 +4417,188 @@ class MainWindow:
         root.bind_all("<Control-f>", lambda e: self.search_entry.focus_set())
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
-        # Barre des modes
-        toolbar = ttk.Frame(root, style="Toolbar.TFrame", padding=(12, 6))
-        toolbar.pack(side="top", fill="x")
-        self.mode_var = tk.StringVar(value=MODE_LIBRARY)
-        ttk.Radiobutton(toolbar, text="📚  Bibliothèque iPhoto", value=MODE_LIBRARY, variable=self.mode_var,
-                        style="Mode.Toolbutton", command=lambda: self.set_mode(self.mode_var.get())).pack(side="left")
-        ttk.Radiobutton(toolbar, text="🗂  Explorer un dossier", value=MODE_FOLDER, variable=self.mode_var,
-                        style="Mode.Toolbutton", command=lambda: self.set_mode(self.mode_var.get())).pack(side="left", padx=(2, 0))
-        ttk.Button(toolbar, text="📂  Ouvrir un dossier…", command=self.open_folder_dialog).pack(side="left", padx=(16, 0))
-        self.folder_opts = ttk.Frame(toolbar, style="Toolbar.TFrame")
-        self.recursive_var = tk.BooleanVar(value=self.settings.folder_recursive)
-        ttk.Checkbutton(self.folder_opts, text="Inclure les sous-dossiers", variable=self.recursive_var,
-                        command=self._on_recursive_toggle, style="Toolbar.TCheckbutton").pack(side="left")
-        ttk.Label(self.folder_opts, text="Trier par :", style="Toolbar.TLabel").pack(side="left", padx=(16, 4))
-        labels = [lbl for lbl, _k, _d in FOLDER_SORTS]
-        self.sort_var = tk.StringVar(value=self.settings.folder_sort if self.settings.folder_sort in labels else labels[0])
-        self.sort_box = ttk.Combobox(self.folder_opts, textvariable=self.sort_var, state="readonly",
-                                     width=30, values=labels)
-        self.sort_box.pack(side="left")
-        self.sort_box.bind("<<ComboboxSelected>>", self._on_sort_change)
-        key, desc = self._sort_choice()
-        self.folder.sort_key, self.folder.sort_desc = key, desc
-
-        # Barre supérieure
-        top = ttk.Frame(root, style="Panel.TFrame", padding=(12, 8))
+        # ---- Barre supérieure : identité, mode, ouverture, recherche --------------------
+        top = ttk.Frame(root, style="Panel.TFrame", padding=(SPACE_L, SPACE_S + 2, SPACE_L, SPACE_S + 2))
         top.pack(side="top", fill="x")
-        left = ttk.Frame(top, style="Panel.TFrame")   # placé après la recherche (voir plus bas)
-        self.title_label = ttk.Label(left, text="iphotor", style="Title.TLabel")
-        self.title_label.pack(anchor="w")
-        self.subtitle_label = ttk.Label(left, text="", style="Muted.TLabel")
-        self.subtitle_label.pack(anchor="w")
+        self.topbar = top
+        top_left = ttk.Frame(top, style="Panel.TFrame")     # empaqueté après la partie droite (prioritaire)
+        brand = ttk.Frame(top_left, style="Panel.TFrame")
+        brand.pack(side="left")
+        ttk.Label(brand, image=ic.get("logo", 28), style="Panel.TLabel").pack(side="left")
+        self.brand_label = ttk.Label(brand, text="iphotor", style="Brand.TLabel")
+        self.brand_label.pack(side="left", padx=(SPACE_S, 0))
 
-        nav = ttk.Frame(top, style="Panel.TFrame")
-        nav.pack(side="right")
-        self.btn_prev = ttk.Button(nav, text="◀  Précédent", command=self.prev_page)
-        self.btn_prev.pack(side="left")
-        self.page_label = ttk.Label(nav, text="", style="Panel.TLabel", width=16, anchor="center")
-        self.page_label.pack(side="left", padx=6)
-        self.btn_next = ttk.Button(nav, text="Suivant  ▶", command=self.next_page)
-        self.btn_next.pack(side="left")
+        self.mode_var = tk.StringVar(value=MODE_LIBRARY)
+        seg = ttk.Frame(top_left, style="Segment.TFrame", padding=3)
+        seg.pack(side="left", padx=(SPACE_XL, 0))
+        self.mode_buttons = {}
+        for mode, label, short, icon in ((MODE_LIBRARY, "Bibliothèque iPhoto", "Bibliothèque", "library"),
+                                         (MODE_FOLDER, "Explorer un dossier", "Dossier", "folder_open")):
+            b = ttk.Radiobutton(seg, text=label, value=mode, variable=self.mode_var, image=ic.get(icon, 16),
+                                compound="left", style="Segment.Toolbutton",
+                                command=lambda: self.set_mode(self.mode_var.get()))
+            b.pack(side="left", padx=(0 if mode == MODE_LIBRARY else 2, 0))
+            b._labels = (label, short)
+            self.mode_buttons[mode] = b
+
+        self.btn_open_lib = ttk.Button(top_left, text="Ouvrir une bibliothèque…", image=ic.get("album", 16),
+                                       compound="left", style="Ghost.TButton", command=self.open_library_dialog)
+        self.btn_open_lib.pack(side="left", padx=(SPACE_M, 0))
+        Tooltip(self.btn_open_lib, "Ouvrir une bibliothèque iPhoto ou Photos (Ctrl+O)")
+        self.btn_open_dir = ttk.Button(top_left, text="Ouvrir un dossier…", image=ic.get("folder_open", 16),
+                                       compound="left", style="Ghost.TButton", command=self.open_folder_dialog)
+        self.btn_open_dir.pack(side="left", padx=(2, 0))
+        Tooltip(self.btn_open_dir, "Explorer les images d'un dossier (Ctrl+Maj+O)")
+
+        self.btn_theme = ttk.Button(top, image=ic.get("sun" if self.settings.theme == "dark" else "moon", 18),
+                                    style="Icon.TButton", command=self.toggle_theme)
+        self.btn_theme.pack(side="right", padx=(SPACE_S, 0))
+        Tooltip(self.btn_theme, "Basculer entre thème clair et thème sombre")
 
         search = ttk.Frame(top, style="Panel.TFrame")
-        search.pack(side="right", padx=(0, 24))
+        search.pack(side="right")
+        self.search_box = ttk.Frame(search, style="Search.TFrame", padding=(9, 2, 3, 2))
+        self.search_box.pack(side="left")
+        self.search_icon = ttk.Label(self.search_box, image=ic.get("search", 16, "muted"), style="SearchIcon.TLabel")
+        self.search_icon.pack(side="left")
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(search, textvariable=self.search_var, width=30)
-        self.search_entry.pack(side="left")
+        self.search_entry = ttk.Entry(self.search_box, textvariable=self.search_var, width=26, style="Search.TEntry")
+        self.search_entry.pack(side="left", fill="x", expand=True)
         self.search_entry.bind("<Return>", lambda e: self.do_search())
         self.search_entry.bind("<Escape>", lambda e: self.clear_search())
+        self.btn_clear = ttk.Button(self.search_box, image=ic.get("close", 14, "muted"), style="SearchClear.TButton",
+                                    command=self.clear_search, takefocus=False)
+        self.btn_clear.pack(side="left")
+        Tooltip(self.btn_clear, "Effacer la recherche (Échap)")
+        self.search_entry.bind("<FocusIn>", lambda e: self._search_focus(True), add="+")
+        self.search_entry.bind("<FocusOut>", lambda e: self._search_focus(False), add="+")
+        self.search_box.bind("<Button-1>", lambda e: self.search_entry.focus_set())
+        self.search_icon.bind("<Button-1>", lambda e: self.search_entry.focus_set())
         self.scope_var = tk.StringVar(value="Toute la photothèque")
-        self.scope = ttk.Combobox(search, textvariable=self.scope_var, state="readonly", width=20,
+        self.scope = ttk.Combobox(search, textvariable=self.scope_var, state="readonly", width=19,
                                   values=("Toute la photothèque", "Album sélectionné"))
-        self.scope.pack(side="left", padx=(6, 0))
-        self.btn_search = ttk.Button(search, text="Rechercher", command=self.do_search)
-        self.btn_search.pack(side="left", padx=(6, 0))
-        ttk.Button(search, text="✕", width=3, command=self.clear_search).pack(side="left", padx=(4, 0))
-        # Le titre prend la place restante : un long chemin n'écrase plus la recherche.
-        left.pack(side="left", fill="x", expand=True)
+        self.scope.pack(side="left", padx=(SPACE_S, 0))
+        self.scope.bind("<<ComboboxSelected>>", lambda e: self.scope.selection_clear())
+        self.btn_search = ttk.Button(search, text="Rechercher", style="Accent.TButton", command=self.do_search,
+                                     image=ic.get("search", 16, "on_accent"), compound="none")
+        self.btn_search.pack(side="left", padx=(SPACE_S, 0))
+        Tooltip(self.btn_search, "Rechercher dans les légendes, commentaires, noms de fichiers… (Ctrl+F)")
+        top_left.pack(side="left", fill="x")
+        ttk.Separator(root, orient="horizontal").pack(side="top", fill="x")
 
-        # Barre d'état
+        # ---- Barre d'état ---------------------------------------------------------------
+        status_bar = ttk.Frame(root, style="Footer.TFrame", padding=(SPACE_M, 0))
+        status_bar.pack(side="bottom", fill="x")
+        ttk.Separator(root, orient="horizontal").pack(side="bottom", fill="x")
         self.status_var = tk.StringVar(value="")
-        status = ttk.Label(root, textvariable=self.status_var, style="Status.TLabel", anchor="w")
-        status.pack(side="bottom", fill="x")
+        ro = ttk.Label(status_bar, text="Lecture seule", image=ic.get("lock", 12, "muted"), compound="left",
+                       style="StatusIcon.TLabel", padding=(SPACE_S, 4))
+        ro.pack(side="right")
+        Tooltip(ro, "Les bibliothèques et les dossiers consultés ne sont jamais modifiés.")
+        status = ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel", anchor="w",
+                           padding=(0, 5))
+        status.pack(side="left", fill="x", expand=True)
 
-        # Corps : arborescence + grille
-        body = tk.PanedWindow(root, orient="horizontal", sashwidth=5, bg=COLORS["bg"], bd=0)
+        # ---- Corps : panneau latéral + contenu ---------------------------------------------
+        body = tk.PanedWindow(root, orient="horizontal", sashwidth=5, bg=COLORS["bg"], bd=0,
+                              sashcursor="sb_h_double_arrow", opaqueresize=True)
         body.pack(side="top", fill="both", expand=True)
+        self.body_pane = body
 
         left_pane = ttk.Frame(body, style="Panel.TFrame")
+        sep = tk.Frame(left_pane, width=1, bg=COLORS["separator"])
+        sep.pack(side="right", fill="y")
+        self.sidebar_caption = ttk.Label(left_pane, text="PHOTOTHÈQUE", style="Section.TLabel",
+                                         padding=(SPACE_L, SPACE_M, SPACE_L, SPACE_XS))
+        self.sidebar_caption.pack(side="top", fill="x")
         tree_frame = ttk.Frame(left_pane, style="Panel.TFrame")
         tree_frame.pack(fill="both", expand=True)
         self.tree_frame = tree_frame
-        self.tree = ttk.Treeview(tree_frame, columns=("n",), show="tree", selectmode="browse")
-        self.tree.column("#0", width=380, stretch=True)
-        self.tree.column("n", width=60, anchor="e", stretch=False)
+        self.tree = ttk.Treeview(tree_frame, columns=("n",), show="tree", selectmode="browse",
+                                 style="Sidebar.Treeview")
+        self.tree.column("#0", width=200, stretch=True)
+        self.tree.column("n", width=56, anchor="e", stretch=False)
         tsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         tsb.pack(side="right", fill="y")
-        self.tree.tag_configure("section", font=self.font_bold, foreground=COLORS["accent"])
-        self.tree.tag_configure("empty", foreground=COLORS["muted"])
-        self.tree.tag_configure("folder", foreground="#d8c88a")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
         self.tree.bind("<Button-3>", lambda e: self._on_tree_menu(e, self.tree))
 
         self.ftree_frame = ttk.Frame(left_pane, style="Panel.TFrame")
-        self.ftree = ttk.Treeview(self.ftree_frame, columns=("n",), show="tree", selectmode="browse")
-        self.ftree.column("#0", width=380, stretch=True)
-        self.ftree.column("n", width=60, anchor="e", stretch=False)
+        self.ftree = ttk.Treeview(self.ftree_frame, columns=("n",), show="tree", selectmode="browse",
+                                  style="Sidebar.Treeview")
+        self.ftree.column("#0", width=200, stretch=True)
+        self.ftree.column("n", width=56, anchor="e", stretch=False)
         fsb = ttk.Scrollbar(self.ftree_frame, orient="vertical", command=self.ftree.yview)
         self.ftree.configure(yscrollcommand=fsb.set)
         self.ftree.pack(side="left", fill="both", expand=True)
         fsb.pack(side="right", fill="y")
-        self.ftree.tag_configure("section", font=self.font_bold, foreground=COLORS["accent"])
-        self.ftree.tag_configure("folder", foreground="#d8c88a")
-        self.ftree.tag_configure("error", foreground=COLORS["missing"])
         self.ftree.bind("<<TreeviewSelect>>", self._on_ftree_select)
         self.ftree.bind("<Button-3>", lambda e: self._on_tree_menu(e, self.ftree))
-        body.add(left_pane, minsize=220, width=460)
+        for t in (self.tree, self.ftree):
+            t.bind("<Motion>", lambda e, tr=t: self._tree_hover(tr, e), add="+")
+            t.bind("<Leave>", lambda e, tr=t: self._tree_unhover(tr), add="+")
+            t.bind("<<TreeviewSelect>>", lambda e, tr=t: self._tree_unhover(tr), add="+")
+        self._configure_tree_tags()
+        body.add(left_pane, minsize=220, width=320)
 
-        grid_frame = ttk.Frame(body, style="Bg.TFrame")
+        content = ttk.Frame(body, style="Bg.TFrame")
+        # En-tête du contenu : titre de la vue, options du mode dossier, pagination
+        header = ttk.Frame(content, style="Header.TFrame", padding=(SPACE_XL, SPACE_L, SPACE_L, SPACE_S))
+        header.pack(side="top", fill="x")
+        self.header = header
+        nav = ttk.Frame(header, style="Header.TFrame")
+        nav.pack(side="right", anchor="n")
+        self.btn_prev = ttk.Button(nav, text="Précédent", compound="left",
+                                   image=(ic.get("chev_left", 16, "text"), "disabled", ic.get("chev_left", 16, "faint")),
+                                   style="TButton", command=self.prev_page)
+        self.btn_prev.pack(side="left")
+        Tooltip(self.btn_prev, "Page précédente (Page préc.)")
+        self.page_label = ttk.Label(nav, text="", style="Header.TLabel", width=13, anchor="center")
+        self.page_label.pack(side="left", padx=SPACE_XS)
+        self.btn_next = ttk.Button(nav, text="Suivant", compound="right",
+                                   image=(ic.get("chev_right", 16, "text"), "disabled", ic.get("chev_right", 16, "faint")),
+                                   style="TButton", command=self.next_page)
+        self.btn_next.pack(side="left")
+        Tooltip(self.btn_next, "Page suivante (Page suiv.)")
+
+        # Barre de filtres du mode dossier (sous l'en-tête)
+        self.folder_opts = ttk.Frame(content, style="Header.TFrame", padding=(SPACE_XL, 0, SPACE_L, SPACE_S))
+        opts_inner = ttk.Frame(self.folder_opts, style="Panel.TFrame", padding=(SPACE_M, 3, 4, 3))
+        opts_inner.pack(side="left")
+        self.recursive_var = tk.BooleanVar(value=self.settings.folder_recursive)
+        ttk.Checkbutton(opts_inner, text="Inclure les sous-dossiers", variable=self.recursive_var,
+                        command=self._on_recursive_toggle).pack(side="left")
+        ttk.Label(opts_inner, text="Trier par", style="Muted.TLabel").pack(side="left", padx=(SPACE_L, SPACE_S))
+        labels = [lbl for lbl, _k, _d in FOLDER_SORTS]
+        self.sort_var = tk.StringVar(value=self.settings.folder_sort if self.settings.folder_sort in labels else labels[0])
+        self.sort_box = ttk.Combobox(opts_inner, textvariable=self.sort_var, state="readonly",
+                                     width=26, values=labels)
+        self.sort_box.pack(side="left")
+        self.sort_box.bind("<<ComboboxSelected>>", self._on_sort_change)
+        key, desc = self._sort_choice()
+        self.folder.sort_key, self.folder.sort_desc = key, desc
+
+        left = ttk.Frame(header, style="Header.TFrame")
+        left.pack(side="left", fill="x", expand=True)
+        self.header_left = left
+        self.title_label = ttk.Label(left, text="iphotor", style="Heading.TLabel")
+        self.title_label.pack(anchor="w")
+        self.subtitle_label = ttk.Label(left, text="", style="Subheading.TLabel")
+        self.subtitle_label.pack(anchor="w", pady=(2, 0))
+
+        grid_frame = ttk.Frame(content, style="Bg.TFrame")
+        grid_frame.pack(side="top", fill="both", expand=True)
+        self.grid_frame = grid_frame
         self.canvas = tk.Canvas(grid_frame, bg=COLORS["bg"], highlightthickness=0)
-        gsb = ttk.Scrollbar(grid_frame, orient="vertical", command=self.canvas.yview)
+        gsb = ttk.Scrollbar(grid_frame, orient="vertical", command=self.canvas.yview,
+                            style="Grid.Vertical.TScrollbar")
         self.canvas.configure(yscrollcommand=gsb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.pack(side="left", fill="both", expand=True, padx=(SPACE_S, 0))
         gsb.pack(side="right", fill="y")
-        body.add(grid_frame, minsize=400)
+        body.add(content, minsize=420)
 
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
@@ -3603,10 +4612,41 @@ class MainWindow:
         self.canvas.configure(yscrollincrement=20)
         root.bind("<Prior>", lambda e: self.prev_page() if not self._focus_in_entry() else None)
         root.bind("<Next>", lambda e: self.next_page() if not self._focus_in_entry() else None)
+        root.bind("<Configure>", self._on_root_resize, add="+")
 
         # Indicateur de chargement (au centre de la grille)
-        self.progress = ttk.Progressbar(grid_frame, mode="indeterminate", length=260)
+        self.progress = ttk.Progressbar(grid_frame, mode="indeterminate", length=260,
+                                        style="Grid.Horizontal.TProgressbar")
         self._update_nav()
+
+    def _search_focus(self, focused: bool) -> None:
+        self.search_box.configure(style="SearchFocus.TFrame" if focused else "Search.TFrame")
+        self.search_icon.configure(style="SearchIconFocus.TLabel" if focused else "SearchIcon.TLabel")
+        self.btn_clear.configure(style="SearchClearFocus.TButton" if focused else "SearchClear.TButton")
+
+    def _on_root_resize(self, event) -> None:
+        """Adapte la barre supérieure à la largeur de la fenêtre (libellés réduits, puis icônes seules)."""
+        if event.widget is not self.root:
+            return
+        w = event.width
+        level = 0 if w >= 1480 else (1 if w >= 1180 else 2)
+        if level == getattr(self, "_compact_level", None):
+            return
+        self._compact_level = level
+        for b in self.mode_buttons.values():
+            b.configure(text=b._labels[0] if level == 0 else b._labels[1])
+        for b in (self.btn_open_lib, self.btn_open_dir):
+            b.configure(compound="left" if level == 0 else "image",
+                        style="Ghost.TButton" if level == 0 else "Icon.TButton")
+        self.brand_label.pack_forget() if level == 2 else self.brand_label.pack(side="left", padx=(SPACE_S, 0))
+        self.search_entry.configure(width={0: 28, 1: 22, 2: 16}[level]
+                                    + (6 if self.mode == MODE_FOLDER else 0))
+        self.scope.configure(width=19 if level < 2 else 14)
+        self.btn_search.configure(compound="none" if level < 2 else "image",
+                                  style="Accent.TButton" if level < 2 else "AccentIcon.TButton")
+        for b, txt in ((self.btn_prev, "Précédent"), (self.btn_next, "Suivant")):
+            b.configure(text=txt if level < 2 else "", compound=("left" if b is self.btn_prev else "right")
+                        if level < 2 else "image")
 
     def _focus_in_entry(self) -> bool:
         return self.root.focus_get() is self.search_entry
@@ -3618,6 +4658,11 @@ class MainWindow:
             name = "Explorer un dossier"
         name = safe_text(name)
         self.root.title(f"{name} — iphotor {APP_VERSION}")
+        if hasattr(self, "sidebar_caption"):
+            caption = "DOSSIER" if self.mode == MODE_FOLDER else "PHOTOTHÈQUE"
+            if name and name != "Explorer un dossier":
+                caption += "  ·  " + re.sub(r"\.photo(s)?library$", "", name).upper()
+            self.sidebar_caption.config(text=caption)
 
     def _rebuild_recent_menu(self) -> None:
         self.m_recent.delete(0, "end")
@@ -3743,18 +4788,19 @@ class MainWindow:
                 self.open_folder(self.settings.last_folder)
 
     def _apply_mode_widgets(self) -> None:
+        level = getattr(self, "_compact_level", 0) or 0
         if self.mode == MODE_FOLDER:
             self.tree_frame.pack_forget()
             self.ftree_frame.pack(fill="both", expand=True)
             self.scope.pack_forget()
-            self.folder_opts.pack(side="left", padx=(24, 0))
-            self.search_entry.configure(width=36)
+            self.folder_opts.pack(side="top", fill="x", before=self.grid_frame)
+            self.search_entry.configure(width={0: 28, 1: 22, 2: 16}[level] + 6)
         else:
             self.ftree_frame.pack_forget()
             self.tree_frame.pack(fill="both", expand=True)
             self.folder_opts.pack_forget()
-            self.scope.pack(side="left", padx=(6, 0), before=self.btn_search)
-            self.search_entry.configure(width=30)
+            self.scope.pack(side="left", padx=(SPACE_S, 0), before=self.btn_search)
+            self.search_entry.configure(width={0: 28, 1: 22, 2: 16}[level])
         self._update_title()
 
     def reload_current(self) -> None:
@@ -3941,15 +4987,16 @@ class MainWindow:
                 key = "/".join(parts[:k])
                 totals[key] = totals.get(key, 0) + n
         name = os.path.basename(f.root) or f.root
-        t.insert("", "end", iid="f:", text="🗂  " + safe_text(name), values=(format_count(totals[""]),),
-                 tags=("section",), open=True)
+        ic = self.icons
+        t.insert("", "end", iid="f:", text=" " + safe_text(name), values=(format_count(totals[""]),),
+                 tags=("section",), open=True, image=ic.get("folder_open", 16, "accent"))
         for rel in sorted((k for k in totals if k), key=lambda k: (k.count("/"), natural_key(k))):
             parent = rel.rpartition("/")[0]
-            t.insert("f:" + parent, "end", iid="f:" + rel, text="📁 " + rel.rpartition("/")[2],
-                     values=(format_count(totals[rel]),), tags=("folder",))
+            t.insert("f:" + parent, "end", iid="f:" + rel, text=" " + rel.rpartition("/")[2],
+                     values=(format_count(totals[rel]),), tags=("folder",), image=ic.get("folder", 16))
         if f.errors:
-            t.insert("", "end", iid="err", text="⚠  Dossiers inaccessibles", values=(format_count(len(f.errors)),),
-                     tags=("error",))
+            t.insert("", "end", iid="err", text=" Dossiers inaccessibles", values=(format_count(len(f.errors)),),
+                     tags=("error",), image=ic.get("warning", 16, "missing"))
             for i, (rel, _reason) in enumerate(f.errors):
                 t.insert("err", "end", iid=f"err:{i}", text=safe_text(rel), tags=("error",))
         if self.mode == MODE_FOLDER:
@@ -4156,11 +5203,14 @@ class MainWindow:
         t.delete(*t.get_children())
         am = self.albums
         total = self.con.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
-        t.insert("", "end", iid="all", text="📷  Toutes les photos", values=(format_count(total),), tags=("section",))
+        ic = self.icons
+        t.insert("", "end", iid="all", text=" Toutes les photos", values=(format_count(total),), tags=("section",),
+                 image=ic.get("photos", 16, "accent"))
 
         # Albums (liste à plat, avec le chemin des dossiers pour lever les homonymies)
         flat = am.albums_flat()
-        t.insert("", "end", iid="sec:albums", text="🖼  Albums", values=(format_count(len(flat)),), tags=("section",))
+        t.insert("", "end", iid="sec:albums", text=" Albums", values=(format_count(len(flat)),), tags=("section",),
+                 image=ic.get("album", 16, "accent"))
         homonyms: dict[tuple[str, str], int] = {}
         for a in flat:
             key = (a.name, am.path_label(a))
@@ -4172,26 +5222,28 @@ class MainWindow:
                 label += self._homonym_hint(a)
             if path:
                 label += f"   ({path})"
-            icon = "⚙ " if a.kind == KIND_SMART else ""
-            t.insert("sec:albums", "end", iid=f"a:{a.id}:flat", text=icon + label,
+            t.insert("sec:albums", "end", iid=f"a:{a.id}:flat", text=" " + label,
+                     image=ic.get("smart" if a.kind == KIND_SMART else "album", 16),
                      values=(format_count(a.photo_count),), tags=("empty",) if a.photo_count == 0 else ())
 
         # Événements, groupés par année
         groups = am.events_by_year()
         n_events = sum(len(e) for _, e in groups)
-        t.insert("", "end", iid="sec:events", text="📅  Événements", values=(format_count(n_events),), tags=("section",))
+        t.insert("", "end", iid="sec:events", text=" Événements", values=(format_count(n_events),),
+                 tags=("section",), image=ic.get("event", 16, "accent"))
         for year, events in groups:
             yid = f"y:{year if year is not None else 'none'}"
             ycount = sum(e.photo_count for e in events)
             t.insert("sec:events", "end", iid=yid,
-                     text=str(year) if year is not None else "Date inconnue",
-                     values=(format_count(ycount),))
+                     text=" " + (str(year) if year is not None else "Date inconnue"),
+                     values=(format_count(ycount),), image=ic.get("event", 16))
             for e in events:
-                t.insert(yid, "end", iid=f"a:{e.id}:ev", text=e.name,
+                t.insert(yid, "end", iid=f"a:{e.id}:ev", text=" " + e.name,
                          values=(format_count(e.photo_count),), tags=("empty",) if e.photo_count == 0 else ())
 
         # Dossiers : hiérarchie complète
-        t.insert("", "end", iid="sec:folders", text="📁  Dossiers", values=("",), tags=("section",))
+        t.insert("", "end", iid="sec:folders", text=" Dossiers", values=("",), tags=("section",),
+                 image=ic.get("folder", 16, "accent"))
 
         def add_children(parent_iid: str, parent_id: Optional[int]) -> int:
             n = 0
@@ -4203,13 +5255,13 @@ class MainWindow:
                 name = child.name + (self._homonym_hint(child) if names[child.name] > 1 else "")
                 if child.kind == KIND_FOLDER:
                     iid = f"a:{child.id}:tree"
-                    t.insert(parent_iid, "end", iid=iid, text="📁 " + name,
+                    t.insert(parent_iid, "end", iid=iid, text=" " + name, image=ic.get("folder", 16),
                              values=(format_count(child.photo_count),), tags=("folder",))
                     add_children(iid, child.id)
                     n += 1
                 elif child.kind in (KIND_ALBUM, KIND_SMART, KIND_SPECIAL) and parent_id is not None:
-                    icon = "⚙ " if child.kind == KIND_SMART else ""
-                    t.insert(parent_iid, "end", iid=f"a:{child.id}:tree", text=icon + name,
+                    t.insert(parent_iid, "end", iid=f"a:{child.id}:tree", text=" " + name,
+                             image=ic.get("smart" if child.kind == KIND_SMART else "album", 16),
                              values=(format_count(child.photo_count),),
                              tags=("empty",) if child.photo_count == 0 else ())
             return n
@@ -4376,7 +5428,7 @@ class MainWindow:
         cols = self._columns()
         width = self.canvas.winfo_width()
         margin = max(5, (width - cols * TILE_W) // 2)
-        return margin + (index % cols) * TILE_W, 8 + (index // cols) * TILE_H
+        return margin + (index % cols) * TILE_W, 4 + (index // cols) * TILE_H
 
     def _layout(self) -> None:
         """Dessine (ou redessine) toutes les vignettes de la page."""
@@ -4407,45 +5459,71 @@ class MainWindow:
         x, y = self._tile_origin(i)
         tag = f"t{i}"
         state = self.tile_images.get(i)
-        bg = COLORS["tile_hover"] if self.hover_index == i else COLORS["tile"]
-        c.create_rectangle(x + 4, y + 4, x + TILE_W - 4, y + TILE_H - 4, fill=bg, outline="",
-                           tags=(tag, f"bg{i}"))
-        cx, cy = x + TILE_W // 2, y + 8 + THUMB_SIZE // 2
+        absolute = self.page_no * PAGE_SIZE + i
+        if self.current_index == absolute:
+            look = "current"
+        elif self.hover_index == i:
+            look = "hover"
+        else:
+            look = "normal"
+        c.create_image(x, y, image=self.card_image(look), anchor="nw", tags=(tag, f"bg{i}"))
+        # Zone de la miniature : carré neutre, photo centrée (proportions respectées)
+        wx, wy = x + (TILE_W - THUMB_SIZE) // 2, y + 12
+        cx, cy = wx + THUMB_SIZE // 2, wy + THUMB_SIZE // 2
+        c.create_image(wx, wy, image=self.well_image(), anchor="nw", tags=(tag,))
+        img_box = (wx, wy, wx + THUMB_SIZE, wy + THUMB_SIZE)
         if isinstance(state, dict) and state.get("img") is not None:
             c.create_image(cx, cy, image=state["img"], anchor="center", tags=(tag,))
+            iw, ih = state.get("size", (THUMB_SIZE, THUMB_SIZE))
+            img_box = (cx - iw // 2, cy - ih // 2, cx + iw // 2, cy + ih // 2)
         else:
-            c.create_rectangle(cx - THUMB_SIZE // 2 + 8, cy - THUMB_SIZE // 2 + 8,
-                               cx + THUMB_SIZE // 2 - 8, cy + THUMB_SIZE // 2 - 8,
-                               fill=COLORS["placeholder"], outline="", tags=(tag,))
-            label = "…"
+            icon, label = "photos", ""
             if isinstance(state, dict):
-                label = {"video": "▶\nVidéo", "raw": "RAW\n(sans aperçu)", "missing": "Image\nintrouvable",
-                         "error": "Image\nillisible"}.get(state.get("status", ""), "Aucun\naperçu")
-            c.create_text(cx, cy, text=label, fill=COLORS["muted"], font=self.font_small,
-                          justify="center", tags=(tag,))
+                icon, label = {"video": ("video", "Vidéo"), "raw": ("image_off", "RAW sans aperçu"),
+                               "missing": ("image_off", "Image introuvable"),
+                               "error": ("warning", "Image illisible")}.get(state.get("status", ""),
+                                                                            ("image_off", "Aucun aperçu"))
+            c.create_image(cx, cy - (10 if label else 0), image=self.icons.get(icon, 32, "faint"), tags=(tag,))
+            if label:
+                c.create_text(cx, cy + 20, text=label, fill=COLORS["muted"], font=self.font_small,
+                              justify="center", tags=(tag,))
+        bx0, by0, bx1, by1 = img_box
+        # Badges sur la photo : vidéo (haut gauche), note (haut droite), favori (bas droite)
         if p.is_video:
-            c.create_rectangle(x + 10, y + 10, x + 62, y + 28, fill=COLORS["video"], outline="", tags=(tag,))
-            c.create_text(x + 36, y + 19, text="▶ VIDÉO", fill="black", font=self.font_small, tags=(tag,))
-        if isinstance(state, dict) and state.get("exists") is False:
-            c.create_rectangle(x + 10, cy + THUMB_SIZE // 2 - 22, x + TILE_W - 10, cy + THUMB_SIZE // 2 - 4,
-                               fill=COLORS["missing"], outline="", tags=(tag,))
-            c.create_text(cx, cy + THUMB_SIZE // 2 - 13, text="⚠ Fichier introuvable", fill="white",
-                          font=self.font_small, tags=(tag,))
+            w = self.font_badge.measure("VIDÉO") + 30
+            c.create_image(bx0 + 6, by0 + 6, image=self.pill_image(w, 20), anchor="nw", tags=(tag,))
+            c.create_image(bx0 + 15, by0 + 16, image=self.icons.get("play", 10, "white"), tags=(tag,))
+            c.create_text(bx0 + 24, by0 + 16, text="VIDÉO", fill="#FFFFFF", font=self.font_badge, anchor="w",
+                          tags=(tag,))
         if p.rating:
-            c.create_text(x + TILE_W - 12, y + 18, text="★" * min(p.rating, 5), fill="#ffd34d",
-                          anchor="e", font=self.font_small, tags=(tag,))
+            stars = "★" * min(p.rating, 5)
+            w = self.font_small.measure(stars) + 14
+            c.create_image(bx1 - 6, by0 + 6, image=self.pill_image(w, 20), anchor="ne", tags=(tag,))
+            c.create_text(bx1 - 6 - w // 2, by0 + 16, text=stars, fill=COLORS["star"], font=self.font_small,
+                          tags=(tag,))
         if self.is_favorite(p):
-            c.create_text(x + TILE_W - 12, y + THUMB_SIZE - 2, text="♥", fill=COLORS["favorite"],
-                          anchor="e", font=self.font_title, tags=(tag,))
-        text_w = TILE_W - 18
-        c.create_text(cx, y + THUMB_SIZE + 22, text=self._truncate(p.label, self.font, text_w),
+            c.create_image(bx1 - 4, by1 - 4, image=self.badge_image("heart_fill", "favorite"), anchor="se",
+                           tags=(tag,))
+        if isinstance(state, dict) and state.get("exists") is False:
+            text = "Fichier introuvable"
+            w = self.font_badge.measure(text) + 34
+            c.create_image(cx, wy + THUMB_SIZE - 6, image=self.pill_image(w, 22, COLORS["missing"], 235),
+                           anchor="s", tags=(tag,))
+            c.create_image(cx - w // 2 + 14, wy + THUMB_SIZE - 17, image=self.icons.get("warning", 12, "white"),
+                           tags=(tag,))
+            c.create_text(cx - w // 2 + 24, wy + THUMB_SIZE - 17, text=text, fill="#FFFFFF", font=self.font_badge,
+                          anchor="w", tags=(tag,))
+        # Légende
+        text_w = TILE_W - 28
+        ty = wy + THUMB_SIZE + 10
+        c.create_text(x + 14, ty, text=self._truncate(p.label, self.font, text_w), anchor="nw",
                       fill=COLORS["text"], font=self.font, tags=(tag,))
         sub = format_date(p.date, with_time=False) if p.date is not None else ""
         if p.label != p.filename and p.filename:
             sub = (sub + "  ·  " if sub else "") + p.filename
         if p.source == "folder":
             sub = (sub + "  ·  " if sub else "") + format_size(p.size)
-        c.create_text(cx, y + THUMB_SIZE + 40, text=self._truncate(sub, self.font_small, text_w),
+        c.create_text(x + 14, ty + 19, text=self._truncate(sub, self.font_small, text_w), anchor="nw",
                       fill=COLORS["muted"], font=self.font_small, tags=(tag,))
 
     def _redraw_tile(self, i: int) -> None:
@@ -4453,15 +5531,19 @@ class MainWindow:
             self.canvas.delete(f"t{i}")
             self._draw_tile(i, self.page_photos[i])
 
-    def _show_grid_message(self, text: str, color: str = COLORS["muted"]) -> None:
+    def _show_grid_message(self, text: str, color: Optional[str] = None) -> None:
+        color = color or COLORS["muted"]
         self._last_grid_msg = (text, color)
         self.canvas.delete("all")
         if not text:
             return
         w = max(self.canvas.winfo_width(), 400)
         h = max(self.canvas.winfo_height(), 300)
-        self.canvas.create_text(w // 2, h // 2 - 40, text=text, fill=color, font=self.font_big,
-                                justify="center", width=w - 60, tags=("msg",))
+        icon = "warning" if color == COLORS["missing"] else ("photos" if color == COLORS["muted"] else "library")
+        self.canvas.create_image(w // 2, h // 2 - 92, image=self.icons.get(icon, 48, "faint" if icon != "warning"
+                                                                            else "missing"), tags=("msgicon",))
+        self.canvas.create_text(w // 2, h // 2 - 52, text=text, fill=color, font=self.font_big, anchor="n",
+                                justify="center", width=min(w - 80, 640), tags=("msg",))
         self.canvas.configure(scrollregion=(0, 0, w, h))
 
     def _on_canvas_resize(self, _event=None) -> None:
@@ -4473,8 +5555,10 @@ class MainWindow:
             msg = self.canvas.find_withtag("msg")
             if msg:
                 w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
-                self.canvas.coords(msg[0], w // 2, h // 2 - 40)
-                self.canvas.itemconfigure(msg[0], width=w - 60)
+                self.canvas.coords(msg[0], w // 2, h // 2 - 52)
+                self.canvas.itemconfigure(msg[0], width=min(w - 80, 640))
+                for item in self.canvas.find_withtag("msgicon"):
+                    self.canvas.coords(item, w // 2, h // 2 - 92)
 
     def _index_at(self, event) -> Optional[int]:
         x = self.canvas.canvasx(event.x)
@@ -4483,7 +5567,7 @@ class MainWindow:
         width = self.canvas.winfo_width()
         margin = max(5, (width - cols * TILE_W) // 2)
         col = int((x - margin) // TILE_W)
-        row = int((y - 8) // TILE_H)
+        row = int((y - 4) // TILE_H)
         if col < 0 or col >= cols or row < 0:
             return None
         i = row * cols + col
@@ -4495,9 +5579,9 @@ class MainWindow:
         old = self.hover_index
         self.hover_index = i
         if old is not None:
-            self.canvas.itemconfigure(f"bg{old}", fill=COLORS["tile"])
+            self.canvas.itemconfigure(f"bg{old}", image=self.card_image(self._tile_look(old)))
         if i is not None:
-            self.canvas.itemconfigure(f"bg{i}", fill=COLORS["tile_hover"])
+            self.canvas.itemconfigure(f"bg{i}", image=self.card_image(self._tile_look(i)))
             p = self.page_photos[i]
             if p.source == "folder":
                 parts = [safe_text(p.image_path), format_size(p.size)]
@@ -4524,11 +5608,16 @@ class MainWindow:
             self.status_var.set("   ·   ".join(parts))
         self.canvas.configure(cursor="hand2" if i is not None else "")
 
+    def _tile_look(self, i: int) -> str:
+        if self.current_index == self.page_no * PAGE_SIZE + i:
+            return "current"
+        return "hover" if self.hover_index == i else "normal"
+
     def _annotation_parts(self, p: Photo) -> list[str]:
         parts = ["♥ favori"] if self.is_favorite(p) else []
         tags = self.tags_of(p)
         if tags:
-            parts.append("🏷 " + ", ".join(tags))
+            parts.append("Tags : " + ", ".join(tags))
         return parts
 
     def _on_canvas_motion(self, event) -> None:
@@ -4548,8 +5637,9 @@ class MainWindow:
                 processed += 1
                 if gen != self.generation:
                     continue   # résultat d'une page qui n'est plus affichée
-                tkimg = ImageTk.PhotoImage(img) if img is not None else None
-                self.tile_images[index] = {"img": tkimg, "exists": exists, "status": status}
+                tkimg = ImageTk.PhotoImage(self.rounded_thumbnail(img)) if img is not None else None
+                self.tile_images[index] = {"img": tkimg, "exists": exists, "status": status,
+                                           "size": img.size if img is not None else None}
                 self._redraw_tile(index)
         except queue.Empty:
             pass
@@ -4572,9 +5662,20 @@ class MainWindow:
     def sync_page_to_index(self, absolute_index: int) -> None:
         """Garde la grille alignée sur la photo affichée dans la visionneuse."""
         page = absolute_index // PAGE_SIZE
+        old = self.current_index
+        self.current_index = absolute_index
         if page != self.page_no and 0 <= page < self.page_count():
             self.page_no = page
             self.load_page()
+            return
+        for idx in (old, absolute_index):     # met en évidence la photo affichée dans la visionneuse
+            if idx is not None and idx // PAGE_SIZE == self.page_no:
+                self._redraw_tile(idx - self.page_no * PAGE_SIZE)
+
+    def viewer_closed(self) -> None:
+        old, self.current_index = self.current_index, None
+        if old is not None and old // PAGE_SIZE == self.page_no:
+            self._redraw_tile(old - self.page_no * PAGE_SIZE)
 
     # -- recherche ---------------------------------------------------------------
     def _search_view(self) -> View:
@@ -4604,18 +5705,19 @@ class MainWindow:
         if t.exists("search"):
             t.delete("search")
         n_photos = self.photos.count(view)
-        t.insert("", 0, iid="search", text=f"🔍  Résultats : « {q} »", values=(format_count(n_photos),),
-                 tags=("section",), open=True)
+        t.insert("", 0, iid="search", text=f" Résultats : « {q} »", values=(format_count(n_photos),),
+                 tags=("section",), open=True, image=self.icons.get("search", 16, "accent"))
         found = self.albums.search(q)
         for a in found:
-            kind = {KIND_FOLDER: "📁 ", KIND_EVENT: "📅 ", KIND_SMART: "⚙ "}.get(a.kind, "🖼 ")
-            label = kind + a.name
+            kind = {KIND_FOLDER: "folder", KIND_EVENT: "event", KIND_SMART: "smart"}.get(a.kind, "album")
+            label = " " + a.name
             path = self.albums.path_label(a)
             if path:
                 label += f"   ({path})"
             elif a.kind == KIND_EVENT and a.year:
                 label += f"   ({a.year})"
-            t.insert("search", "end", iid=f"s:a:{a.id}", text=label, values=(format_count(a.photo_count),))
+            t.insert("search", "end", iid=f"s:a:{a.id}", text=label, values=(format_count(a.photo_count),),
+                     image=self.icons.get(kind, 16))
         self._set_status(f"Recherche « {q} » : {plural(n_photos, 'photo')}, "
                          f"{plural(len(found), 'album ou événement', 'albums ou événements')} trouvés.")
         t.see("search")
@@ -4753,14 +5855,14 @@ class MainWindow:
         for iid in ("fav", "sec:tags"):
             if t.exists(iid):
                 t.delete(iid)
-        t.insert("", pos, iid="fav", text="♥  Mes favoris", values=(format_count(self._annotation_count(favs)),),
-                 tags=("section",))
+        t.insert("", pos, iid="fav", text=" Mes favoris", values=(format_count(self._annotation_count(favs)),),
+                 tags=("section",), image=self.icons.get("heart", 16, "favorite"))
         self._tag_names = tags
         if tags:
-            t.insert("", pos + 1, iid="sec:tags", text="🏷  Tags", values=(format_count(len(tags)),),
-                     tags=("section",), open=bool(was_open))
+            t.insert("", pos + 1, iid="sec:tags", text=" Tags", values=(format_count(len(tags)),),
+                     tags=("section",), open=bool(was_open), image=self.icons.get("tag", 16, "accent"))
             for i, (name, keys) in enumerate(zip(tags, tag_keys)):
-                t.insert("sec:tags", "end", iid=f"tag:{i}", text=name,
+                t.insert("sec:tags", "end", iid=f"tag:{i}", text=" " + name, image=self.icons.get("hash", 16),
                          values=(format_count(self._annotation_count(keys)),))
         # Resélectionne l'entrée courante sans recharger la grille.
         target = None
@@ -5025,20 +6127,25 @@ class MainWindow:
     def photo_menu(self, p: Photo, parent, x: int, y: int, open_cmd: Optional[Callable] = None) -> None:
         m = tk.Menu(parent, tearoff=False)
         if open_cmd is not None:
-            m.add_command(label="Ouvrir", command=open_cmd)
+            m.add_command(label="  Ouvrir", command=open_cmd, image=self.icons.get("photos", 16), compound="left")
             m.add_separator()
-        m.add_command(label="Copier l'image", command=lambda: self.copy_image(p, parent), accelerator="Ctrl+C")
-        m.add_command(label="Copier le chemin du fichier", command=lambda: self.copy_path(p),
-                      accelerator="Ctrl+Maj+C")
-        m.add_command(label="Copier vers un dossier…", command=lambda: self.copy_photo_to(p, parent),
-                      accelerator="Ctrl+S")
+        ic = self.icons
+        m.add_command(label="  Copier l'image", command=lambda: self.copy_image(p, parent), accelerator="Ctrl+C",
+                      image=ic.get("copy", 16), compound="left")
+        m.add_command(label="  Copier le chemin du fichier", command=lambda: self.copy_path(p),
+                      accelerator="Ctrl+Maj+C", image=ic.get("file", 16), compound="left")
+        m.add_command(label="  Copier vers un dossier…", command=lambda: self.copy_photo_to(p, parent),
+                      accelerator="Ctrl+S", image=ic.get("folder_arrow", 16), compound="left")
         m.add_separator()
         fav = self.is_favorite(p)
-        m.add_command(label="♥  Retirer des favoris" if fav else "♡  Ajouter aux favoris",
-                      command=lambda: self.toggle_favorite(p, parent), accelerator="F")
-        m.add_command(label="🏷  Tags…", command=lambda: self.edit_tags(p, parent), accelerator="T")
+        m.add_command(label="  Retirer des favoris" if fav else "  Ajouter aux favoris",
+                      command=lambda: self.toggle_favorite(p, parent), accelerator="F",
+                      image=ic.get("heart_fill" if fav else "heart", 16, "favorite"), compound="left")
+        m.add_command(label="  Tags…", command=lambda: self.edit_tags(p, parent), accelerator="T",
+                      image=ic.get("tag", 16), compound="left")
         m.add_separator()
-        m.add_command(label="Informations EXIF…", command=lambda: self.show_exif(p, parent), accelerator="I")
+        m.add_command(label="  Informations EXIF…", command=lambda: self.show_exif(p, parent), accelerator="I",
+                      image=ic.get("info", 16), compound="left")
         try:
             m.tk_popup(x, y)
         finally:
@@ -5080,11 +6187,12 @@ class MainWindow:
                   or self._album_from_iid(iid) is not None)
         if not ok:
             return
-        label = tree.item(iid, "text").strip().lstrip("📷🖼📅📁🗂♥🏷🔍⚙ ").strip()
+        label = tree.item(iid, "text").strip()
         if len(label) > 50:
             label = label[:49] + "…"
         m = tk.Menu(tree, tearoff=False)
-        m.add_command(label=f"Copier « {label} » vers un dossier…", command=lambda: self.copy_tree_item(iid))
+        m.add_command(label=f"  Copier « {label} » vers un dossier…", command=lambda: self.copy_tree_item(iid),
+                      image=self.icons.get("folder_arrow", 16), compound="left")
         if iid.startswith("tag:"):
             name = self._tag_names[int(iid[4:])]
             m.add_separator()

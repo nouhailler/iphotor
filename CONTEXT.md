@@ -12,7 +12,9 @@ depuis Linux. iphotor permet de les parcourir sous Debian en conservant leur org
 Depuis la version 1.3, il sert aussi de visionneuse pour n'importe quel dossier d'images
 (mode « Explorer un dossier »), avec les mêmes garanties de lecture seule.
 La version 1.4 ajoute la copie (presse-papiers, dossier de destination), les favoris, les
-tags et l'affichage des informations EXIF.
+tags et l'affichage des informations EXIF. La version 1.5 modernise toute l'interface
+(design system, icônes, thème clair et sombre) sans changer le comportement : voir
+`docs/rapport-modernisation-design.md`.
 
 ## 2. Contraintes non négociables
 
@@ -163,6 +165,9 @@ iphotor.py
 ├── PhotoManager     requêtes paginées par vue (toutes, album, année, recherche)
 ├── ThumbnailLoader  4 threads : cache local → miniature de la bibliothèque → image ; résultats via une queue
 ├── load_pil_image() JPEG/PNG/… (Pillow), HEIC (GdkPixbuf), RAW (aperçu intégré)
+├── PALETTES/COLORS  design system : palettes claire et sombre ; COLORS = palette courante, modifiée en place
+├── Theme            styles ttk (clam) + éléments arrondis (images Pillow, regénérées par paste au changement de thème)
+├── Icons            icônes au trait dessinées par draw_icon() (grille 24, suréchantillonnage), cache de PhotoImage
 ├── PhotoViewer      fenêtre de visualisation (chargement dans un thread, redimensionnement)
 ├── LibraryDialog    fenêtre « Ouvrir une bibliothèque » (récentes, détectées, parcourir)
 ├── FolderScanner    mode dossier : recherche des images (os.scandir, thread, annulable, erreurs tolérées)
@@ -207,6 +212,17 @@ iphotor.py
 - **Presse-papiers :** Tk ne sait copier que du texte. L'image est convertie en PNG, puis
   confiée à `wl-copy` ou `xclip`, sinon à un petit processus Python/GTK (X11, donc aussi
   XWayland) qui garde l'image jusqu'à ce qu'une autre application prenne le presse-papiers.
+- **Design system :** aucune couleur en dur dans les widgets : tout passe par `COLORS`
+  (jamais en valeur par défaut d'un paramètre, évaluée une seule fois). Les éléments ttk sont
+  des images créées une fois (`element_create`) puis repeintes avec `PhotoImage.paste()` lors
+  d'un changement de thème ; les icônes aussi (`Icons.refresh`). Les images composées de la
+  grille (cartes, badges) passent par `MainWindow._custom()`.
+- **Grille :** les cartes, le fond des miniatures et les badges sont des images partagées
+  (une par état), ce qui garde le dessin d'une page rapide. Les coins arrondis des miniatures
+  sont appliqués dans le thread Tk à la création du PhotoImage (masque mis en cache par taille).
+  Le dessin des 100 cartes prend environ 35 ms.
+- **Frames ttk :** l'option `padding` d'un style n'est pas appliquée aux `ttk.Frame` ; la passer
+  au widget (sinon les enfants recouvrent le fond arrondi).
 - **Version du schéma :** `INDEX_SCHEMA_VERSION`. À incrémenter à chaque modification du
   schéma, ce qui force la reconstruction de l'index.
 

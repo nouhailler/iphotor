@@ -4,6 +4,43 @@ Toutes les évolutions notables d'iphotor sont consignées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), versions selon
 [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [1.5.0] — 2026-11-27
+
+Modernisation complète de l'interface. Aucune fonctionnalité, aucun raccourci et aucune règle
+de lecture seule ne change. Détails et captures avant/après :
+[docs/rapport-modernisation-design.md](docs/rapport-modernisation-design.md).
+
+### Modifié
+
+- **Nouvelle identité visuelle** : thème clair par défaut (fond #F5F6F8, panneaux blancs, bleu
+  #3978D5), police système unique (Cantarell, Noto Sans ou DejaVu Sans selon le système),
+  hiérarchie typographique et espacements cohérents.
+- **Icônes** : un seul jeu d'icônes au trait, dessinées par iphotor (aucun fichier ni accès
+  réseau), à la place des emojis et symboles Unicode disparates.
+- **Boutons, champs et cases à cocher arrondis**, avec états survol, pressé, désactivé et focus
+  clavier ; bouton principal en bleu dans chaque fenêtre.
+- **Barre supérieure** : logo, sélecteur de mode segmenté, boutons « Ouvrir une
+  bibliothèque » et « Ouvrir un dossier », champ de recherche arrondi. Elle s'adapte à la
+  largeur de la fenêtre (libellés réduits puis icônes seules, avec info-bulles).
+- **Panneau latéral** : icônes par rubrique, flèches de dépliage fines, sélection bleu doux,
+  survol des lignes, nom de la source en tête.
+- **Galerie** : vignettes en cartes arrondies avec ombre douce, miniatures à coins arrondis,
+  badges lisibles (vidéo, note, favori, fichier introuvable) ; la photo affichée dans la
+  visionneuse est encadrée dans la grille. Titre de la vue et pagination au-dessus de la grille ;
+  options du mode dossier dans une barre dédiée.
+- **Visionneuse** : fond neutre sombre, photo centrée avec marge, flèches précédente/suivante en
+  surimpression, barre d'actions à icônes (Favori, Tags, Infos, Copier, Chemin, Copier vers…,
+  Ouvrir) et informations sous la photo.
+- **Fenêtres secondaires** harmonisées (en-tête avec icône, pied de fenêtre avec bouton
+  principal) : bibliothèques, tags, EXIF, copie, progression.
+- **Barre d'état** discrète, avec l'indicateur « Lecture seule ».
+- Contraste du texte secondaire relevé (WCAG AA, 4,5:1).
+
+### Ajouté
+
+- **Thème sombre** facultatif : menu *Affichage › Thème sombre* ou bouton lune/soleil de la barre
+  supérieure ; le choix est mémorisé.
+
 ## [1.4.0] — 2026-11-23
 
 ### Ajouté
@@ -165,6 +202,7 @@ Première version fonctionnelle.
 - Le nom d'événement est stocké dans la table `photos`, pour garder des requêtes paginées
   sous 0,1 s.
 
+[1.5.0]: ../../releases/tag/v1.5.0
 [1.4.0]: ../../releases/tag/v1.4.0
 [1.3.0]: ../../releases/tag/v1.3.0
 [1.2.0]: ../../releases/tag/v1.2.0

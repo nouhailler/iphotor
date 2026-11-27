@@ -5,9 +5,11 @@ seule**, une ancienne bibliothèque iPhoto (iPhoto 9.x) ou une bibliothèque
 de l'app Photos 1 à 4 (macOS 10.10 à 10.14), ainsi que **n'importe quel dossier d'images**
 de l'ordinateur ou d'un disque externe. Les photos peuvent être copiées (presse-papiers ou
 dossier de destination), marquées comme favorites, classées par tags, et leurs informations
-EXIF affichées.
+EXIF affichées. L'interface propose un thème clair (par défaut) et un thème sombre.
 
-Version actuelle : **1.4.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
+![Fenêtre principale d'iphotor](docs/captures/apres/01_principale_toutes.png)
+
+Version actuelle : **1.5.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historique et
 [CONTEXT.md](CONTEXT.md) pour le contexte, les contraintes et la structure des bibliothèques
 (AlbumData.xml d'iPhoto, base SQLite de Photos).
 
@@ -42,11 +44,11 @@ Version actuelle : **1.4.0**. Voir [CHANGELOG.md](CHANGELOG.md) pour l'historiqu
 
 ### Option A : paquet .deb (recommandé)
 
-Téléchargez `iphotor_1.4.0_all.deb` depuis la
+Téléchargez `iphotor_1.5.0_all.deb` depuis la
 [page des releases](../../releases), puis :
 
 ```bash
-sudo apt install ./iphotor_1.4.0_all.deb
+sudo apt install ./iphotor_1.5.0_all.deb
 ```
 
 `apt` installe automatiquement les dépendances. L'application apparaît dans le menu
@@ -100,7 +102,13 @@ n'est trouvée au démarrage, la fenêtre « Ouvrir une bibliothèque » s'affic
 
 ## 5. Utilisation
 
-La barre du haut propose deux modes : **Bibliothèque iPhoto** et **Explorer un dossier**.
+La barre du haut propose deux modes : **Bibliothèque iPhoto** et **Explorer un dossier**,
+les boutons *Ouvrir une bibliothèque…* et *Ouvrir un dossier…*, et le champ de recherche.
+Quand la fenêtre est étroite, ces boutons n'affichent plus que leur icône (une info-bulle
+rappelle leur rôle). Le titre de la vue et la pagination se trouvent au-dessus de la grille.
+
+**Thème** : *Affichage › Thème sombre*, ou le bouton lune / soleil en haut à droite. Le choix
+est mémorisé dans `~/.config/iphotor/config.json`.
 Chaque mode garde son état (sélection, page, recherche, position dans la grille) quand on
 passe de l'un à l'autre.
 
@@ -171,7 +179,7 @@ vignette survolée par le pointeur dans la fenêtre principale.
 | Copier l'image | Ctrl+C | place l'image dans le presse-papiers ; elle se colle (Ctrl+V) dans un traitement de texte, un logiciel de retouche, une messagerie… |
 | Copier le chemin du fichier | Ctrl+Maj+C | copie le chemin d'accès du fichier, sous forme de texte |
 | Copier vers un dossier… | Ctrl+S | copie le fichier de la photo dans le dossier choisi |
-| Ajouter aux favoris / retirer | F | la photo apparaît dans « ♥ Mes favoris » ; un cœur s'affiche sur sa vignette |
+| Ajouter aux favoris / retirer | F | la photo apparaît dans « Mes favoris » ; un cœur s'affiche sur sa vignette |
 | Tags… | T | cocher des tags existants ou en créer (séparés par des virgules) |
 | Informations EXIF… | I | appareil, objectif, date de prise de vue, temps de pose, ouverture, ISO, focale, flash, orientation, coordonnées GPS… puis toutes les balises par groupe |
 
@@ -295,6 +303,10 @@ automatiquement dans le dossier de sa bibliothèque au premier lancement.
 - **Identité des albums** : toujours par `AlbumId`, jamais par nom. Les doublons de clés et
   les clés de photos inexistantes (fréquentes dans les `KeyList` de dossiers) sont ignorés.
   `KeyListString` est pris en charge comme alternative à `KeyList`.
+- **Interface** : Tkinter et ttk (thème `clam` personnalisé). Les couleurs viennent d'une
+  palette centrale (`PALETTES`, clair et sombre) ; les boutons, champs et cases arrondis et
+  toutes les icônes sont dessinés par Pillow au démarrage : aucune ressource externe, aucune
+  dépendance supplémentaire.
 - **Performances** : pagination SQL (`LIMIT/OFFSET`), vignettes chargées par 4 threads,
   décodage JPEG réduit (`draft`), images de la page précédente libérées à chaque changement
   de page, une seule image en grand en mémoire.

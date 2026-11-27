@@ -7,5 +7,5 @@ Exec=iphotor
 Icon=iphotor
 Terminal=false
 Categories=Graphics;Photography;Viewer;
-Keywords=iPhoto;photo;album;événement;dossier;images;visionneuse;favoris;tags;EXIF;copie;
+Keywords=iPhoto;photo;album;événement;dossier;images;visionneuse;favoris;tags;EXIF;copie;galerie;
 StartupWMClass=Iphotor
